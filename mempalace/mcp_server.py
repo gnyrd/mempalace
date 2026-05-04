@@ -780,6 +780,182 @@ def tool_prepare_write(
     }
 
 
+def tool_commit_write(
+    guard_token: str,
+    fate: str,
+    candidate_relations: list = None,
+    advisory_acknowledged: list = None,
+    merged_content: str = None,
+):
+    """Commit a guarded write previously staged via tool_prepare_write.
+
+    Validates fate-vs-relation consistency, re-checks candidates against the
+    palace, performs the operations dictated by the relations with preimage-
+    based compensating rollback on failure, and returns an audit trail.
+
+    See spec § commit_write for full semantics.
+    """
+    import time
+    from mempalace import guard
+
+    candidate_relations = candidate_relations or []
+    advisory_acknowledged = advisory_acknowledged or []
+    started_at = time.time()
+
+    # Step 1: token lookup
+    store = guard.get_token_store()
+    try:
+        rec = store.consume(guard_token)  # single-use
+    except guard.TokenError as e:
+        return {
+            "error": str(e),
+            "audit_trail": {
+                "prepare_token": guard_token[:8] + "...",
+                "fate": fate,
+                "ops_attempted": [], "ops_completed": [],
+                "rollback_attempted": False, "rollback_completed": False,
+                "preimages_captured": [],
+                "resulting_drawer_ids": [], "resulting_tunnel_ids": [],
+                "elapsed_ms": int((time.time() - started_at) * 1000),
+            },
+        }
+
+    # Step 2-5: validate
+    try:
+        guard.validate_commit_args(
+            fate=fate,
+            candidate_relations=candidate_relations,
+            blocking_ids=rec.blocking_ids,
+            merged_content=merged_content,
+        )
+    except guard.ValidationError as e:
+        return {
+            "error": str(e),
+            "audit_trail": {
+                "prepare_token": guard_token[:8] + "...",
+                "fate": fate,
+                "candidate_ids_seen": rec.blocking_ids,
+                "candidate_ids_addressed": [r["drawer_id"] for r in candidate_relations],
+                "candidate_relations": candidate_relations,
+                "advisory_acknowledged": advisory_acknowledged,
+                "ops_attempted": [], "ops_completed": [],
+                "rollback_attempted": False, "rollback_completed": False,
+                "preimages_captured": [],
+                "resulting_drawer_ids": [], "resulting_tunnel_ids": [],
+                "elapsed_ms": int((time.time() - started_at) * 1000),
+            },
+        }
+
+    # Step 6: re-check candidates (parallel-writer race detection) -- Task 10 will fill this in.
+    # For now, accept (Task 10 wires the re-check).
+
+    # Step 7: content-hash binding -- Task 10.
+
+    # Step 8: perform operations
+    ctx = guard.OperationContext()
+    new_drawer_id = None
+
+    try:
+        # Capture preimages for any drawer we'll mutate
+        for r in candidate_relations:
+            if r["relation"] in (
+                guard.Relation.SUPERSEDES,
+                guard.Relation.RESOLVES_CONTRADICTION,
+                guard.Relation.STRENGTHENS_TARGET,
+            ):
+                ctx.capture_preimage(r["drawer_id"])
+
+        # Fate-level: create or skip the new drawer
+        if fate == guard.Fate.CREATE_NEW:
+            add_res = tool_add_drawer(
+                wing=rec.wing, room=rec.room, content=rec.prepared_content,
+            )
+            if not add_res.get("success"):
+                raise RuntimeError(f"add_drawer failed: {add_res}")
+            new_drawer_id = add_res["drawer_id"]
+            ctx.record_added_drawer(new_drawer_id)
+            ctx.op_log.append({"op": "add_drawer", "args": {"wing": rec.wing, "room": rec.room},
+                               "result": {"drawer_id": new_drawer_id}})
+
+        # Iterate candidate relations
+        for r in candidate_relations:
+            if r["relation"] == guard.Relation.STRENGTHENS_TARGET:
+                ops = guard.apply_relation(
+                    relation=r["relation"],
+                    target_drawer_id=r["drawer_id"],
+                    new_drawer_id=None,
+                    association=r.get("association"),
+                    merged_content=merged_content,
+                )
+            else:
+                ops = guard.apply_relation(
+                    relation=r["relation"],
+                    target_drawer_id=r["drawer_id"],
+                    new_drawer_id=new_drawer_id,
+                    association=r.get("association"),
+                    merged_content=None,
+                )
+            for op in ops:
+                ctx.record_op(op)
+                guard.raise_if_op_failed(op)
+
+    except guard.GuardOpError as e:
+        for op in getattr(e, "op_log", []):
+            if op not in ctx.op_log:
+                ctx.record_op(op)
+        ctx.rollback()
+        return {
+            "error": str(e),
+            "audit_trail": _build_audit_trail(
+                guard_token, fate, rec, candidate_relations, advisory_acknowledged,
+                ctx, started_at, new_drawer_id,
+            ),
+        }
+    except Exception as e:
+        ctx.rollback()
+        return {
+            "error": str(e),
+            "audit_trail": _build_audit_trail(
+                guard_token, fate, rec, candidate_relations, advisory_acknowledged,
+                ctx, started_at, new_drawer_id,
+            ),
+        }
+
+    # Success path
+    return {
+        "fate_taken": fate,
+        "resulting_drawer_ids": [new_drawer_id] if new_drawer_id else [],
+        "resulting_tunnel_ids": ctx.created_tunnel_ids,
+        "audit_trail": _build_audit_trail(
+            guard_token, fate, rec, candidate_relations, advisory_acknowledged,
+            ctx, started_at, new_drawer_id,
+        ),
+    }
+
+
+def _build_audit_trail(token, fate, rec, candidate_relations, advisory_acknowledged,
+                      ctx, started_at, new_drawer_id):
+    import time
+    from mempalace import guard
+    return {
+        "prepare_token": token[:8] + "...",
+        "fate": fate,
+        "candidate_ids_seen": rec.blocking_ids,
+        "candidate_ids_addressed": [r["drawer_id"] for r in candidate_relations],
+        "candidate_relations": candidate_relations,
+        "advisory_acknowledged": advisory_acknowledged,
+        "ops_attempted": ctx.op_log,
+        "ops_completed": [op for op in ctx.op_log if not guard.op_failed(op)],
+        "rollback_attempted": ctx.rollback_attempted,
+        "rollback_completed": ctx.rollback_completed,
+        "rollback_errors": ctx.rollback_errors,  # per-op errors during rollback (empty on success)
+        "preimages_captured": list(ctx.preimages.keys()),
+        "resulting_drawer_ids": [new_drawer_id] if new_drawer_id else [],
+        "resulting_tunnel_ids": ctx.created_tunnel_ids,
+        "elapsed_ms": int((time.time() - started_at) * 1000),
+    }
+
+
 def tool_get_aaak_spec():
     """Return the AAAK dialect specification."""
     return {"aaak_spec": AAAK_SPEC}
