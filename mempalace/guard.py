@@ -250,3 +250,30 @@ def validate_commit_args(
             )
         if not merged_content:
             raise ValidationError("merged_content required for fate=update_existing")
+
+
+# ============================================================================
+# Process-wide singletons (server-side)
+# ============================================================================
+
+
+_token_store: Optional[TokenStore] = None
+
+
+def get_token_store() -> TokenStore:
+    """Return the process-wide TokenStore, creating on first use.
+
+    Reads policy at first access; TTL set from policy.token_ttl_seconds.
+    """
+    global _token_store
+    if _token_store is None:
+        from mempalace.policy import load_policy
+        pol = load_policy()
+        _token_store = TokenStore(ttl_seconds=pol.token_ttl_seconds)
+    return _token_store
+
+
+def reset_token_store() -> None:
+    """Test helper: drop the singleton so the next get_token_store() rebuilds with current policy."""
+    global _token_store
+    _token_store = None

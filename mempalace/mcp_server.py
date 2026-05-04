@@ -710,6 +710,76 @@ def tool_check_duplicate(content: str, threshold: float = 0.9):
         return {"error": "Duplicate check failed"}
 
 
+def tool_prepare_write(
+    content: str,
+    wing: str,
+    room: str,
+    type: str,
+    date: str,
+    source: str,
+    threshold: float = None,
+):
+    """Stage a guarded write. Returns candidates + a guard_token for commit_write.
+
+    Per the write-guard v2 spec, this gates new drawer writes. The agent must
+    classify each blocking candidate at commit_write time before the write lands.
+    """
+    import hashlib
+    from mempalace import guard
+    from mempalace.policy import load_policy
+    from mempalace.retrieval import rank_candidates
+
+    pol = load_policy()
+    eff_threshold = threshold if threshold is not None else pol.default_threshold
+    eff_advisory_floor = pol.advisory_floor
+
+    result = rank_candidates(
+        content=content,
+        wing=wing,
+        room=room,
+        type_=type,
+        threshold=eff_threshold,
+        advisory_floor=eff_advisory_floor,
+    )
+
+    content_hash = hashlib.sha256(content.encode()).hexdigest()
+    blocking_ids = [c.drawer_id for c in result.blocking]
+    advisory_ids = [c.drawer_id for c in result.advisory]
+
+    store = guard.get_token_store()
+    token = store.issue(
+        content_hash=content_hash,
+        blocking_ids=blocking_ids,
+        advisory_ids=advisory_ids,
+        wing=wing,
+        room=room,
+        type=type,
+        prepared_content=content,
+        effective_threshold=eff_threshold,
+        effective_advisory_floor=eff_advisory_floor,
+    )
+    rec = store.get(token)
+
+    def _ser(c):
+        return {
+            "drawer_id": c.drawer_id,
+            "title": c.title,
+            "body": c.body,
+            "wing": c.wing,
+            "room": c.room,
+            "type": c.type,
+            "similarity": c.similarity,
+        }
+
+    import datetime
+    return {
+        "guard_token": token,
+        "expires_at": datetime.datetime.fromtimestamp(rec.expires_at).isoformat(),
+        "blocking_candidates": [_ser(c) for c in result.blocking],
+        "advisory_candidates": [_ser(c) for c in result.advisory],
+    }
+
+
 def tool_get_aaak_spec():
     """Return the AAAK dialect specification."""
     return {"aaak_spec": AAAK_SPEC}
