@@ -1,10 +1,9 @@
 """Tests for the write-guard policy file loader."""
 import json
-from pathlib import Path
 
 import pytest
 
-from mempalace.policy import load_policy, Policy, DEFAULT_POLICY
+from mempalace.policy import load_policy, DEFAULT_POLICY
 
 
 def test_default_policy_when_no_file(tmp_path, monkeypatch):

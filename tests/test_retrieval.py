@@ -6,7 +6,7 @@ per the policy thresholds.
 """
 import pytest
 
-from mempalace.retrieval import rank_candidates, Candidate
+from mempalace.retrieval import rank_candidates
 
 
 # Test palace fixture: assumes a small corpus of drawers in tmp palace.
@@ -375,7 +375,7 @@ def test_weak_vector_hit_with_common_lexical_overlap_does_not_block(small_palace
     lexical gate fails, so the score is just vec_sim ~= 0.3. (Codex v2.1
     review.)
     """
-    from mempalace import mcp_server, retrieval as r
+    from mempalace import retrieval as r
 
     def stub_low_sim_vector(col, content, n):
         # Return one real seeded drawer at high distance (low vec_sim).

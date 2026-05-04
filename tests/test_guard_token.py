@@ -3,7 +3,7 @@ import time
 
 import pytest
 
-from mempalace.guard import TokenStore, TokenRecord, TokenError
+from mempalace.guard import TokenStore, TokenError
 
 
 def test_issue_returns_unique_tokens():
