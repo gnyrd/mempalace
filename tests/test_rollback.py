@@ -159,3 +159,186 @@ def test_rollback_swallowed_tunnel_error_recorded(palace, monkeypatch):
     assert ctx.rollback_completed is False
     assert any("tunnel" in e["op"] and "blew up" in e["error"]
                for e in ctx.rollback_errors)
+
+
+def test_commit_supersedes_rollback_on_tunnel_failure(palace, monkeypatch):
+    """If tunnel creation fails mid-supersede, rollback restores old drawer + deletes new."""
+    from mempalace import mcp_server
+
+    seed = mcp_server.tool_add_drawer(
+        wing="testwing", room="do",
+        content="DO seed\n\nauthor: claude\ntype: evidence\ndate: 2026-05-01\n"
+                "source: test\nstatus: confirmed\n\nbody",
+    )
+    seed_id = seed["drawer_id"]
+
+    pr = mcp_server.tool_prepare_write(
+        content="DO seed\n\nauthor: claude\ntype: evidence\ndate: 2026-05-04\n"
+                "source: test\nstatus: confirmed\n\nbody updated",
+        wing="testwing", room="do", type="evidence", date="2026-05-04", source="test",
+    )
+    if not pr["blocking_candidates"]:
+        pytest.skip("retrieval did not surface seed")
+
+    # Patch tool_create_tunnel to raise
+    def boom(**kwargs):
+        raise RuntimeError("simulated tunnel failure")
+    monkeypatch.setattr(mcp_server, "tool_create_tunnel", boom)
+
+    cr = mcp_server.tool_commit_write(
+        guard_token=pr["guard_token"],
+        fate="create_new",
+        candidate_relations=[
+            {"drawer_id": seed_id, "relation": "supersedes"},
+        ] + [{"drawer_id": c["drawer_id"], "relation": "ignored_spurious"}
+              for c in pr["blocking_candidates"] if c["drawer_id"] != seed_id],
+    )
+    assert "error" in cr
+    audit = cr["audit_trail"]
+    assert audit["rollback_attempted"] is True
+    assert audit["rollback_completed"] is True
+
+    # Old drawer body restored (status: confirmed)
+    seed_after = mcp_server.tool_get_drawer(seed_id)
+    assert "status: confirmed" in seed_after["content"]
+    assert "status: superseded" not in seed_after["content"]
+
+
+def test_commit_supersedes_rollback_on_tunnel_error_dict(palace, monkeypatch):
+    """MemPalace primitives often return error dicts instead of raising. A
+    tunnel error dict must abort the relation before status is flipped and
+    trigger rollback of the newly-created drawer."""
+    from mempalace import mcp_server
+
+    seed = mcp_server.tool_add_drawer(
+        wing="testwing", room="do",
+        content="DO seed dict\n\nauthor: claude\ntype: evidence\ndate: 2026-05-01\n"
+                "source: test\nstatus: confirmed\n\nbody",
+    )
+    seed_id = seed["drawer_id"]
+
+    pr = mcp_server.tool_prepare_write(
+        content="DO seed dict\n\nauthor: claude\ntype: evidence\ndate: 2026-05-04\n"
+                "source: test\nstatus: confirmed\n\nbody updated",
+        wing="testwing", room="do", type="evidence", date="2026-05-04", source="test",
+    )
+    if not pr["blocking_candidates"]:
+        pytest.skip("retrieval did not surface seed")
+
+    def returns_error_dict(**kwargs):
+        return {"success": False, "error": "simulated dict-return tunnel failure"}
+    monkeypatch.setattr(mcp_server, "tool_create_tunnel", returns_error_dict)
+
+    cr = mcp_server.tool_commit_write(
+        guard_token=pr["guard_token"],
+        fate="create_new",
+        candidate_relations=[
+            {"drawer_id": seed_id, "relation": "supersedes"},
+        ] + [{"drawer_id": c["drawer_id"], "relation": "ignored_spurious"}
+              for c in pr["blocking_candidates"] if c["drawer_id"] != seed_id],
+    )
+    assert "error" in cr
+    assert "dict-return tunnel failure" in cr["error"]
+    audit = cr["audit_trail"]
+    assert audit["rollback_attempted"] is True
+    assert audit["rollback_completed"] is True
+    assert len(audit["ops_attempted"]) != len(audit["ops_completed"])
+
+    # Status was never flipped after the failed tunnel op.
+    seed_after = mcp_server.tool_get_drawer(seed_id)
+    assert "status: confirmed" in seed_after["content"]
+    assert "status: superseded" not in seed_after["content"]
+
+
+def test_commit_strengthens_rollback_on_update_failure(palace, monkeypatch):
+    """If update_drawer fails for strengthens, original body must be restored."""
+    from mempalace import mcp_server
+
+    seed = mcp_server.tool_add_drawer(
+        wing="testwing", room="do",
+        content="DO original\n\nauthor: claude\ntype: evidence\ndate: 2026-05-01\n"
+                "source: test\nstatus: confirmed\n\nORIGINAL_BODY",
+    )
+    seed_id = seed["drawer_id"]
+
+    pr = mcp_server.tool_prepare_write(
+        content="DO original\n\nauthor: claude\ntype: evidence\ndate: 2026-05-04\n"
+                "source: test\nstatus: confirmed\n\nORIGINAL_BODY",
+        wing="testwing", room="do", type="evidence", date="2026-05-04", source="test",
+    )
+    if not pr["blocking_candidates"]:
+        pytest.skip("retrieval did not surface seed")
+
+    # Patch tool_update_drawer to raise
+    real = mcp_server.tool_update_drawer
+    call_count = [0]
+    def boom(**kwargs):
+        call_count[0] += 1
+        # First call (the strengthens update) fails; later calls (rollback) succeed
+        if call_count[0] == 1:
+            raise RuntimeError("simulated update failure")
+        return real(**kwargs)
+    monkeypatch.setattr(mcp_server, "tool_update_drawer", boom)
+
+    cr = mcp_server.tool_commit_write(
+        guard_token=pr["guard_token"],
+        fate="update_existing",
+        candidate_relations=[
+            {"drawer_id": seed_id, "relation": "strengthens_target"},
+        ] + [{"drawer_id": c["drawer_id"], "relation": "ignored_spurious"}
+              for c in pr["blocking_candidates"] if c["drawer_id"] != seed_id],
+        merged_content="MERGED_NEVER_LANDS",
+    )
+    assert "error" in cr
+    seed_after = mcp_server.tool_get_drawer(seed_id)
+    assert "ORIGINAL_BODY" in seed_after["content"]
+    assert "MERGED_NEVER_LANDS" not in seed_after["content"]
+
+
+def test_commit_strengthens_rollback_on_update_error_dict(palace, monkeypatch):
+    """An update_drawer error dict must be treated as a failed commit, not a
+    successful strengthens operation with fewer ops_completed than ops_attempted."""
+    from mempalace import mcp_server
+
+    seed = mcp_server.tool_add_drawer(
+        wing="testwing", room="do",
+        content="DO original dict\n\nauthor: claude\ntype: evidence\ndate: 2026-05-01\n"
+                "source: test\nstatus: confirmed\n\nORIGINAL_BODY_DICT",
+    )
+    seed_id = seed["drawer_id"]
+
+    pr = mcp_server.tool_prepare_write(
+        content="DO original dict\n\nauthor: claude\ntype: evidence\ndate: 2026-05-04\n"
+                "source: test\nstatus: confirmed\n\nORIGINAL_BODY_DICT",
+        wing="testwing", room="do", type="evidence", date="2026-05-04", source="test",
+    )
+    if not pr["blocking_candidates"]:
+        pytest.skip("retrieval did not surface seed")
+
+    real = mcp_server.tool_update_drawer
+    call_count = [0]
+    def returns_error_dict(**kwargs):
+        call_count[0] += 1
+        if call_count[0] == 1:
+            return {"success": False, "error": "simulated dict-return update failure"}
+        return real(**kwargs)
+    monkeypatch.setattr(mcp_server, "tool_update_drawer", returns_error_dict)
+
+    cr = mcp_server.tool_commit_write(
+        guard_token=pr["guard_token"],
+        fate="update_existing",
+        candidate_relations=[
+            {"drawer_id": seed_id, "relation": "strengthens_target"},
+        ] + [{"drawer_id": c["drawer_id"], "relation": "ignored_spurious"}
+              for c in pr["blocking_candidates"] if c["drawer_id"] != seed_id],
+        merged_content="MERGED_DICT_NEVER_LANDS",
+    )
+    assert "error" in cr
+    assert "dict-return update failure" in cr["error"]
+    audit = cr["audit_trail"]
+    assert audit["rollback_attempted"] is True
+    assert audit["rollback_completed"] is True
+
+    seed_after = mcp_server.tool_get_drawer(seed_id)
+    assert "ORIGINAL_BODY_DICT" in seed_after["content"]
+    assert "MERGED_DICT_NEVER_LANDS" not in seed_after["content"]
