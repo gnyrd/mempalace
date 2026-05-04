@@ -144,3 +144,61 @@ def test_audit_trail_present_on_success(palace):
     assert "ops_attempted" in audit
     assert "ops_completed" in audit
     assert audit["rollback_attempted"] is False
+
+
+def test_commit_refuses_when_blocking_set_changes(palace):
+    """If a new blocking candidate appears between prepare and commit, refuse."""
+    from mempalace import mcp_server
+    pr = mcp_server.tool_prepare_write(
+        content=_drawer("racecase"),
+        wing="testwing", room="do", type="evidence",
+        date="2026-05-04", source="test",
+    )
+    # Inject a near-neighbor between prepare and commit
+    mcp_server.tool_add_drawer(
+        wing="testwing", room="do",
+        content=_drawer("racecase-similar"),
+    )
+    cr = mcp_server.tool_commit_write(
+        guard_token=pr["guard_token"],
+        fate="create_new",
+        candidate_relations=[
+            {"drawer_id": c["drawer_id"], "relation": "ignored_spurious"}
+            for c in pr["blocking_candidates"]
+        ],
+    )
+    assert "error" in cr
+    assert "candidates_changed" in cr["error"]
+
+
+def test_commit_refuses_unknown_token(palace):
+    from mempalace import mcp_server
+    cr = mcp_server.tool_commit_write(
+        guard_token="not-a-real-token",
+        fate="create_new",
+        candidate_relations=[],
+    )
+    assert "error" in cr
+    assert "unknown" in cr["error"]
+
+
+def test_commit_refuses_expired_token(palace, monkeypatch):
+    """Token TTL=0.05s means immediate expiry."""
+    from mempalace import mcp_server, guard
+    # Force very short TTL by reconstructing the singleton
+    guard._token_store = guard.TokenStore(ttl_seconds=0.05)
+
+    pr = mcp_server.tool_prepare_write(
+        content=_drawer("expiretest"),
+        wing="testwing", room="do", type="evidence",
+        date="2026-05-04", source="test",
+    )
+    import time as _time
+    _time.sleep(0.1)
+    cr = mcp_server.tool_commit_write(
+        guard_token=pr["guard_token"],
+        fate="create_new",
+        candidate_relations=[],
+    )
+    assert "error" in cr
+    assert "expired" in cr["error"]

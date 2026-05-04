@@ -846,10 +846,43 @@ def tool_commit_write(
             },
         }
 
-    # Step 6: re-check candidates (parallel-writer race detection) -- Task 10 will fill this in.
-    # For now, accept (Task 10 wires the re-check).
-
-    # Step 7: content-hash binding -- Task 10.
+    # Step 6: re-check candidates against current palace state.
+    # Replay the EXACT retrieval params captured at prepare_write so a
+    # policy change between prepare and commit can't produce false
+    # candidates_changed errors.
+    from mempalace.retrieval import rank_candidates
+    fresh = rank_candidates(
+        content=rec.prepared_content,
+        wing=rec.wing,
+        room=rec.room,
+        type_=rec.type,
+        threshold=rec.effective_threshold,
+        advisory_floor=rec.effective_advisory_floor,
+    )
+    fresh_blocking = sorted([c.drawer_id for c in fresh.blocking])
+    original_blocking = sorted(rec.blocking_ids)
+    if fresh_blocking != original_blocking:
+        diff_added = sorted(set(fresh_blocking) - set(original_blocking))
+        diff_dropped = sorted(set(original_blocking) - set(fresh_blocking))
+        return {
+            "error": (
+                f"candidates_changed_call_prepare_again: "
+                f"added={diff_added}, dropped={diff_dropped}"
+            ),
+            "audit_trail": {
+                "prepare_token": guard_token[:8] + "...",
+                "fate": fate,
+                "candidate_ids_seen": rec.blocking_ids,
+                "candidate_ids_addressed": [r["drawer_id"] for r in candidate_relations],
+                "candidate_relations": candidate_relations,
+                "advisory_acknowledged": advisory_acknowledged,
+                "ops_attempted": [], "ops_completed": [],
+                "rollback_attempted": False, "rollback_completed": False,
+                "preimages_captured": [],
+                "resulting_drawer_ids": [], "resulting_tunnel_ids": [],
+                "elapsed_ms": int((time.time() - started_at) * 1000),
+            },
+        }
 
     # Step 8: perform operations
     ctx = guard.OperationContext()
