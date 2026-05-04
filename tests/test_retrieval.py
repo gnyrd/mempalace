@@ -488,9 +488,9 @@ def test_vector_only_candidate_uses_full_corpus_bm25_floor(small_palace, monkeyp
     def stub_bm25_pull(col, content, n):
         all_data = col.get(include=["documents", "metadatas"])
         if not all_data["ids"]:
-            return [], [], [], [], {}
+            return [], [], [], {}
         full_map = {did: 0.5 for did in all_data["ids"]}  # well below 2.0 floor
-        return [], [], [], [], full_map
+        return [], [], [], full_map
 
     monkeypatch.setattr(r, "_bm25_pull", stub_bm25_pull)
 

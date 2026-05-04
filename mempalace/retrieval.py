@@ -162,17 +162,21 @@ def _vector_pull(col, content: str, n: int):
 def _bm25_pull(col, content: str, n: int):
     """Top-N by BM25 over the entire palace.
 
-    Returns (ids, docs, metas, raw_scores, full_raw_by_id) where:
-      - ids/docs/metas/raw_scores are the top-N union members (parallel lists,
-        sorted by raw BM25 descending);
+    Returns (ids, docs, metas, full_raw_by_id) where:
+      - ids/docs/metas are the top-N union members, sorted by raw BM25
+        descending. They are the candidate-supply side of the union.
       - full_raw_by_id is `{drawer_id -> raw_bm25}` covering EVERY drawer in
         the corpus, not just the top-N. The lexical gate consumes this so
         that vector-only candidates (which won't be in the top-N) still get
-        gated against full-corpus IDF rather than falling back to a union-
-        local recompute. (Codex v1.8 + v2.1 reviews.)
+        gated against full-corpus IDF rather than a union-local recompute.
+        (Codex v1.8 + v2.1 reviews.)
+
+    The top-N parallel raw-score list was dropped — no caller used it after
+    full_raw_by_id became the source of truth for the gate. (Codex v2.1
+    round-3 review.)
 
     Pulls all drawers from the collection (Chroma get with no filter), scores
-    each by Okapi-BM25 against the query content, returns top-N by BM25 score
+    each by Okapi-BM25 against the query content, returns top-N IDs/docs/metas
     plus the full-corpus map. For palaces of ~10K drawers this is O(N)
     tokenization + scoring, ~few hundred ms. Acceptable at write time.
 
@@ -182,7 +186,7 @@ def _bm25_pull(col, content: str, n: int):
     """
     all_ = col.get(include=["documents", "metadatas"])
     if not all_["ids"]:
-        return [], [], [], [], {}
+        return [], [], [], {}
     docs = all_["documents"]
     stripped_query = _strip_typed_header(content)
     stripped_docs = [_strip_typed_header(d) for d in docs]
@@ -196,8 +200,7 @@ def _bm25_pull(col, content: str, n: int):
     ids = [all_["ids"][i] for i in indexed]
     out_docs = [docs[i] for i in indexed]
     out_metas = [all_["metadatas"][i] for i in indexed]
-    out_raw_scores = [bm25_raw[i] for i in indexed]
-    return ids, out_docs, out_metas, out_raw_scores, full_raw_by_id
+    return ids, out_docs, out_metas, full_raw_by_id
 
 
 def rank_candidates(
@@ -237,7 +240,7 @@ def rank_candidates(
     #    palace — used by the lexical gate so vector-only candidates (not in
     #    the BM25 top-N) get evaluated against full-corpus IDF rather than
     #    union-local IDF.
-    bm25_ids, bm25_docs, bm25_metas, bm25_full_raw, bm25_full_raw_by_id = _bm25_pull(
+    bm25_ids, bm25_docs, bm25_metas, bm25_full_raw_by_id = _bm25_pull(
         col, content, n_results
     )
 
