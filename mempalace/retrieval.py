@@ -160,27 +160,34 @@ def _vector_pull(col, content: str, n: int):
 
 
 def _bm25_pull(col, content: str, n: int):
-    """Top-N by BM25 over the entire palace. Returns (ids, docs, metas, raw_scores).
+    """Top-N by BM25 over the entire palace.
+
+    Returns (ids, docs, metas, raw_scores, full_raw_by_id) where:
+      - ids/docs/metas/raw_scores are the top-N union members (parallel lists,
+        sorted by raw BM25 descending);
+      - full_raw_by_id is `{drawer_id -> raw_bm25}` covering EVERY drawer in
+        the corpus, not just the top-N. The lexical gate consumes this so
+        that vector-only candidates (which won't be in the top-N) still get
+        gated against full-corpus IDF rather than falling back to a union-
+        local recompute. (Codex v1.8 + v2.1 reviews.)
 
     Pulls all drawers from the collection (Chroma get with no filter), scores
-    each by Okapi-BM25 against the query content, returns top-N by BM25 score.
-    For palaces of ~10K drawers this is O(N) tokenization + scoring, ~few
-    hundred ms. Acceptable at write time.
+    each by Okapi-BM25 against the query content, returns top-N by BM25 score
+    plus the full-corpus map. For palaces of ~10K drawers this is O(N)
+    tokenization + scoring, ~few hundred ms. Acceptable at write time.
 
     BM25 runs over header-stripped content so shared typed-memory boilerplate
     (author/type/date/source/status) doesn't drive matches. Returned docs
     are the FULL original (callers may still need the header for display).
-    Raw scores are computed against the FULL corpus and are reused for the
-    BM25-only raw-floor gate; do not recompute that floor over the small union
-    because `_bm25_scores` computes IDF over the provided document set.
     """
     all_ = col.get(include=["documents", "metadatas"])
     if not all_["ids"]:
-        return [], [], [], []
+        return [], [], [], [], {}
     docs = all_["documents"]
     stripped_query = _strip_typed_header(content)
     stripped_docs = [_strip_typed_header(d) for d in docs]
     bm25_raw = _bm25_scores(stripped_query, stripped_docs)
+    full_raw_by_id = dict(zip(all_["ids"], bm25_raw))
     indexed = sorted(
         range(len(docs)),
         key=lambda i: bm25_raw[i],
@@ -190,7 +197,7 @@ def _bm25_pull(col, content: str, n: int):
     out_docs = [docs[i] for i in indexed]
     out_metas = [all_["metadatas"][i] for i in indexed]
     out_raw_scores = [bm25_raw[i] for i in indexed]
-    return ids, out_docs, out_metas, out_raw_scores
+    return ids, out_docs, out_metas, out_raw_scores, full_raw_by_id
 
 
 def rank_candidates(
@@ -225,15 +232,20 @@ def rank_candidates(
     # 1. Vector pull (top-K by Chroma embedding distance)
     vec_ids, vec_docs, vec_metas, vec_distances = _vector_pull(col, content, n_results)
 
-    # 2. BM25-only pull (top-K by lexical match over the entire corpus)
-    bm25_ids, bm25_docs, bm25_metas, bm25_full_raw = _bm25_pull(col, content, n_results)
+    # 2. BM25-only pull (top-K by lexical match over the entire corpus). Also
+    #    returns a full-corpus raw-score map covering every drawer in the
+    #    palace — used by the lexical gate so vector-only candidates (not in
+    #    the BM25 top-N) get evaluated against full-corpus IDF rather than
+    #    union-local IDF.
+    bm25_ids, bm25_docs, bm25_metas, bm25_full_raw, bm25_full_raw_by_id = _bm25_pull(
+        col, content, n_results
+    )
 
     # 3. Union: dedupe by drawer_id, preserving first-seen ordering for stability
     union_ids: list = []
     union_docs: dict = {}
     union_metas: dict = {}
     union_distances: dict = {}  # drawer_id → distance (only set for vector hits)
-    bm25_full_raw_by_id: dict = {}  # drawer_id → full-corpus raw BM25 score
 
     for i, did in enumerate(vec_ids):
         if did not in union_docs:
@@ -242,7 +254,6 @@ def rank_candidates(
             union_metas[did] = vec_metas[i] or {}
             union_distances[did] = vec_distances[i]
     for i, did in enumerate(bm25_ids):
-        bm25_full_raw_by_id[did] = bm25_full_raw[i]
         if did not in union_docs:
             union_ids.append(did)
             union_docs[did] = bm25_docs[i]
@@ -252,13 +263,13 @@ def rank_candidates(
     if not union_ids:
         return RetrievalResult(blocking=[], advisory=[])
 
-    # 4. BM25 over the union — both raw (for absolute gate) and normalized
-    #    (for hybrid scoring with vector signal). Run BM25 on header-stripped
-    #    content so shared typed-memory boilerplate doesn't drive scores.
+    # 4. BM25 over the union — used only for normalized scoring. The raw
+    #    floor gate uses full-corpus raw scores (above), NOT this union-local
+    #    recompute, since `_bm25_scores` computes IDF relative to the
+    #    provided corpus.
     stripped_query = _strip_typed_header(content)
     union_stripped = [_strip_typed_header(union_docs[did]) for did in union_ids]
     bm25_union = _bm25_scores(stripped_query, union_stripped)
-    bm25_raw_by_id = {did: bm25_union[i] for i, did in enumerate(union_ids)}
     max_bm25 = max(bm25_union) if bm25_union and max(bm25_union) > 0 else 1.0
     bm25_norm_by_id = {did: (bm25_union[i] / max_bm25) for i, did in enumerate(union_ids)}
 
@@ -292,7 +303,13 @@ def rank_candidates(
     distinctive_query_tokens = {t for t in _tokenize(stripped_query) if len(t) >= 4}
     bm25_signal_passes_gate = {}  # gate decision for BM25 score contribution
     for did in union_ids:
-        raw = bm25_full_raw_by_id.get(did, bm25_raw_by_id[did])
+        # Use full-corpus raw BM25 for ALL union IDs (no fallback to union-
+        # local). A vector-only candidate that didn't make the BM25 top-N
+        # still has a real full-corpus score in `bm25_full_raw_by_id`. The
+        # 0.0 fallback is defensive only — every union id should have come
+        # from either vec_ids or bm25_ids, both of which are subsets of the
+        # collection that bm25_full_raw_by_id covers.
+        raw = bm25_full_raw_by_id.get(did, 0.0)
         if raw < _MIN_BM25_RAW:
             bm25_signal_passes_gate[did] = False
             continue

@@ -459,3 +459,75 @@ def test_incoming_type_does_not_change_retrieval(small_palace):
         f"because behavior changed intentionally, also update the "
         f"rank_candidates docstring."
     )
+
+
+def test_vector_only_candidate_uses_full_corpus_bm25_floor(small_palace, monkeypatch):
+    """A vector-only candidate (in `_vector_pull` but NOT in `_bm25_pull`'s
+    top-N) must have its lexical gate evaluated against FULL-CORPUS raw BM25,
+    not a fallback recompute over the union.
+
+    Bug shape (caught in Codex v2.1 second-round review): the previous fix
+    populated `bm25_full_raw_by_id` only for IDs present in the BM25 top-N.
+    Vector-only candidates fell through to a union-local BM25 recompute,
+    where IDF is inflated for shared tokens (term-in-1-of-2 docs looks rare).
+    A weak vector hit with a common 4+ char token could pass the raw floor
+    via the union-local recompute even though its full-corpus raw BM25 was
+    below `_MIN_BM25_RAW`, then receive normalized BM25 contribution that
+    promoted it to blocking.
+
+    Fix: `_bm25_pull` returns a full-corpus raw-score map covering every
+    drawer; `bm25_full_raw_by_id.get(did, 0.0)` (no union-local fallback)
+    is the only source of truth for the gate.
+    """
+    from mempalace import retrieval as r
+
+    # Stub _bm25_pull: empty top-N, full-corpus map showing every drawer's
+    # raw BM25 is below the floor. Mimics the case where the vector
+    # candidate's full-corpus BM25 is genuinely weak — only common tokens
+    # overlap.
+    def stub_bm25_pull(col, content, n):
+        all_data = col.get(include=["documents", "metadatas"])
+        if not all_data["ids"]:
+            return [], [], [], [], {}
+        full_map = {did: 0.5 for did in all_data["ids"]}  # well below 2.0 floor
+        return [], [], [], [], full_map
+
+    monkeypatch.setattr(r, "_bm25_pull", stub_bm25_pull)
+
+    # Stub _vector_pull: return one drawer at moderate vec_sim. Picking the
+    # first seeded drawer (the chat.guid DO drawer) — its body has 4+ char
+    # tokens like "thread", "primary", "testing" that distinctive-token
+    # check would pass on, but full-corpus BM25 for the query is weak.
+    def stub_vector_pull(col, content, n):
+        all_data = col.get(include=["documents", "metadatas"])
+        if not all_data["ids"]:
+            return [], [], [], []
+        return (
+            [all_data["ids"][0]],
+            [all_data["documents"][0]],
+            [all_data["metadatas"][0]],
+            [0.5],  # distance 0.5 -> vec_sim 0.5
+        )
+
+    monkeypatch.setattr(r, "_vector_pull", stub_vector_pull)
+
+    result = r.rank_candidates(
+        # "thread" is a 4+ char token shared with the chat.guid drawer body
+        # ("DO use chat.guid as thread_id"). Distinctive-token gate would
+        # pass IF the raw floor passed. The bug let union-local BM25 mask
+        # the weak full-corpus signal; the fix forces full-corpus raw.
+        content="DO use the thread thing",
+        wing="testwing",
+        room="do",
+        type_="evidence",
+        threshold=0.7,
+        advisory_floor=0.5,
+    )
+
+    blocking_ids = [c.drawer_id for c in result.blocking]
+    assert blocking_ids == [], (
+        f"vector-only candidate (not in BM25 top-N) was promoted to blocking "
+        f"despite full-corpus raw BM25 below floor: {result.blocking}. The "
+        f"lexical gate must use the full-corpus raw-score map for ALL union "
+        f"IDs, not fall back to union-local BM25 for vector-only candidates."
+    )
