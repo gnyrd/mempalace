@@ -431,3 +431,103 @@ def apply_relation(
         return op_log
 
     raise ValueError(f"unhandled relation: {relation!r}")
+# ============================================================================
+# OperationContext — preimages + rollback
+#
+# A short-lived (single commit_write call) container that tracks all writes
+# performed during a commit, including preimages of mutated drawers, IDs of
+# added drawers, and IDs of created tunnels. On rollback, all changes are
+# reversed in reverse order using existing primitives.
+# ============================================================================
+
+
+class OperationContext:
+    def __init__(self):
+        self.preimages: dict = {}
+        self.added_drawer_ids: list = []
+        self.created_tunnel_ids: list = []
+        self.op_log: list = []
+        self.rollback_attempted: bool = False
+        self.rollback_completed: bool = False
+        # Per spec v1.2: accumulate rollback errors so audit trail can surface
+        # partial-state drift. rollback_completed is True ONLY if this list is
+        # empty AND every compensating op succeeded.
+        self.rollback_errors: list = []
+
+    def capture_preimage(self, drawer_id: str) -> None:
+        from mempalace import mcp_server
+        cur = mcp_server.tool_get_drawer(drawer_id)
+        if not cur or cur.get("error"):
+            return
+        self.preimages[drawer_id] = {
+            "content": cur.get("content"),
+            "wing": cur.get("wing"),
+            "room": cur.get("room"),
+        }
+
+    def record_added_drawer(self, drawer_id: str) -> None:
+        self.added_drawer_ids.append(drawer_id)
+
+    def record_op(self, op_entry: dict) -> None:
+        self.op_log.append(op_entry)
+        if op_entry.get("op") == "create_tunnel":
+            # NOTE (Task 8 plan deviation): tool_create_tunnel returns a
+            # tunnel dict keyed "id" (not "tunnel_id"). Plan v2.0 used
+            # "tunnel_id" — patched to actual MemPalace v3.3.3 API.
+            # Flagged for Codex v2.2.
+            tid = (op_entry.get("result") or {}).get("id")
+            if tid:
+                self.created_tunnel_ids.append(tid)
+
+    def rollback(self) -> None:
+        """Compensating rollback. Accumulates errors per failed op; only sets
+        rollback_completed=True when EVERY compensating op succeeded.
+        """
+        from mempalace import mcp_server
+        self.rollback_attempted = True
+
+        # Reverse-order rollback. Each compensating op gets a try/except that
+        # records the error rather than swallowing silently.
+
+        # 1. Delete created tunnels
+        for tid in reversed(self.created_tunnel_ids):
+            try:
+                res = mcp_server.tool_delete_tunnel(tunnel_id=tid)
+                if isinstance(res, dict) and res.get("error"):
+                    self.rollback_errors.append({
+                        "op": "delete_tunnel", "id": tid, "error": res["error"],
+                    })
+            except Exception as e:
+                self.rollback_errors.append({
+                    "op": "delete_tunnel", "id": tid, "error": str(e),
+                })
+
+        # 2. Restore preimaged drawers
+        for did, pre in self.preimages.items():
+            try:
+                if pre.get("content") is None:
+                    raise RuntimeError(f"corrupt preimage for {did}: content is None")
+                res = mcp_server.tool_update_drawer(drawer_id=did, content=pre["content"])
+                if isinstance(res, dict) and res.get("error"):
+                    self.rollback_errors.append({
+                        "op": "restore_preimage", "id": did, "error": res["error"],
+                    })
+            except Exception as e:
+                self.rollback_errors.append({
+                    "op": "restore_preimage", "id": did, "error": str(e),
+                })
+
+        # 3. Delete added drawers
+        for did in reversed(self.added_drawer_ids):
+            try:
+                res = mcp_server.tool_delete_drawer(drawer_id=did)
+                if isinstance(res, dict) and res.get("error"):
+                    self.rollback_errors.append({
+                        "op": "delete_drawer", "id": did, "error": res["error"],
+                    })
+            except Exception as e:
+                self.rollback_errors.append({
+                    "op": "delete_drawer", "id": did, "error": str(e),
+                })
+
+        self.rollback_completed = (len(self.rollback_errors) == 0)
