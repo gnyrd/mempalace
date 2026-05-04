@@ -1,0 +1,362 @@
+"""Hybrid candidate retrieval for prepare_write.
+
+Performs candidate UNION (not vector-pool reranking):
+  1. Vector pull from Chroma — top-K nearest by embedding distance
+  2. BM25-only pull — top-K nearest by lexical/Okapi-BM25 over the corpus
+  3. Union the two pools (dedupe by drawer_id) so a near-neighbor that
+     vector misses can still be surfaced via lexical match, and vice versa
+  4. Score every candidate in the union: weighted (vector × BM25) + tech boost
+  5. Apply wing/room/type-aware adjustments
+  6. Return blocking + advisory splits per policy thresholds
+
+Why union (not just rerank): if the seed drawer's embedding is far from the
+query's embedding (paraphrased content with limited token overlap, exactly
+the M3/M6/M7 misses in the 2026-05-03 dedup test), it never enters the vector
+top-K, so reranking can't recover it. A separate BM25 pull over the corpus
+catches drawers with shared distinctive lexical tokens (identifiers, code
+paths, technical terms) that a vector miss would silently drop.
+
+Reuses `mempalace.searcher._bm25_scores` and `_tokenize` (zero new deps).
+"""
+import re
+from dataclasses import dataclass
+
+# Reuse existing BM25 implementation (zero new dependencies)
+from mempalace.searcher import _bm25_scores, _tokenize
+
+
+# Match common technical token shapes: dotted paths, snake_case identifiers,
+# CamelCase function call patterns.
+_TECH_TOKEN_RE = re.compile(
+    r"\b(?:[a-z_][a-z0-9_]*\.[a-z_][a-z0-9_.]+|[A-Z][a-zA-Z0-9]*\(|"
+    r"[a-z]+_[a-z_]+|[A-Z][a-zA-Z]+\.[A-Z][a-zA-Z]+)\b"
+)
+
+# Absolute raw BM25 floor for BM25-only candidates. Below this, the "best in
+# pool" candidate is just sharing common tokens, not exhibiting real lexical
+# similarity. Tune via the 7-paraphrase acceptance test in test_dedup_acceptance
+# if false positives or false negatives appear.
+_MIN_BM25_RAW = 2.0
+
+# Typed-memory header keys (per vault/CLAUDE.md schema). These lines (label
+# AND value) must be removed entirely from the typed-memory HEADER BLOCK only —
+# both label and value are boilerplate ("claude", "evidence", "confirmed" are
+# shared across every drawer). Do not strip every matching lowercase line
+# globally: later semantic evidence can legitimately contain lines like
+# `status: 500 on checkout` or `source: webhook payload`.
+_HEADER_KEYS = ("author", "type", "date", "source", "status")
+_HEADER_LINE_RE = re.compile(
+    r"^(?:" + "|".join(_HEADER_KEYS) + r"):.*$",
+)
+
+# Body-template label prefixes (per AAAK drawer schema). The LABEL is shared
+# boilerplate across drawers — must be stripped. The VALUE after the label is
+# the actual semantic content and is preserved.
+#
+# **Use an explicit allowlist**, not a broad "Title Case followed by colon"
+# pattern. A broad pattern would strip meaningful domain prefixes like
+# "HTTP:", "OAuth:", "SwiftUI:", "Postgres:", "Mailchimp:" if an agent ever
+# wrote them at line start, hurting BM25 recall on exactly the distinctive
+# tokens the guard needs to catch. (Codex caught this in the v1.6 review.)
+#
+# Allowlist drawn from:
+#   - DO room: Tried because / Evidence / Caveat
+#   - DONT room: Tried because / Expected / Actual / Use instead
+#   - contradiction-drawer.md: Position A / Position B / Holder / Claim /
+#     Context / Recommendation / Resolution status / To resolve
+#   - resolution-drawer.md: Original positions / Merged stance /
+#     Why this beats either position alone / Linked contradictions
+_BODY_TEMPLATE_LABELS = (
+    "Tried because",
+    "Evidence",
+    "Caveat",
+    "Expected",
+    "Actual",
+    "Use instead",
+    "Position A",
+    "Position B",
+    "Holder",
+    "Claim",
+    "Context",
+    "Recommendation",
+    "Resolution status",
+    "To resolve",
+    "Original positions",
+    "Merged stance",
+    "Why this beats either position alone",
+    "Linked contradictions",
+)
+_BODY_LABEL_RE = re.compile(
+    r"^\s*(?:" + "|".join(re.escape(_l) for _l in _BODY_TEMPLATE_LABELS) + r"):\s*",
+    re.MULTILINE,
+)
+
+
+def _strip_typed_header(body: str) -> str:
+    """Remove template boilerplate so BM25 / distinctive-token analysis only
+    sees semantic content.
+
+    Two passes:
+      1. Drop typed-memory header lines entirely (label + value) from the
+         first header block only — header values like "claude", "evidence",
+         "confirmed" are shared across every drawer. Semantic lines later in
+         the body that happen to start with `status:` or `source:` are kept.
+      2. Drop body-template label prefixes only — values are kept since
+         that's where the actual semantic content lives.
+    """
+    title, sep1, rest = body.partition("\n\n")
+    if sep1:
+        header_block, sep2, semantic_body = rest.partition("\n\n")
+        if sep2:
+            kept_header_lines = [
+                line for line in header_block.splitlines()
+                if not _HEADER_LINE_RE.match(line)
+            ]
+            no_header = title + "\n\n" + "\n".join(kept_header_lines) + "\n\n" + semantic_body
+        else:
+            no_header = body
+    else:
+        no_header = body
+    return _BODY_LABEL_RE.sub("", no_header)
+
+
+@dataclass
+class Candidate:
+    drawer_id: str
+    title: str
+    body: str
+    wing: str
+    room: str
+    type: str
+    similarity: float
+
+
+@dataclass
+class RetrievalResult:
+    blocking: list  # Candidate, similarity >= threshold
+    advisory: list  # Candidate, advisory_floor <= similarity < threshold
+
+
+def _extract_tech_tokens(s: str) -> set:
+    return set(_TECH_TOKEN_RE.findall(s))
+
+
+def _parse_drawer_type(body: str) -> str:
+    """Extract the typed-memory header `type:` field from a drawer body."""
+    m = re.search(r"^type:\s*(\S+)", body, re.MULTILINE)
+    return m.group(1) if m else ""
+
+
+def _vector_pull(col, content: str, n: int):
+    """Top-N by Chroma vector similarity. Returns aligned (ids, docs, metas, distances) or empty."""
+    raw = col.query(
+        query_texts=[content],
+        n_results=n,
+        include=["metadatas", "documents", "distances"],
+    )
+    if not raw["ids"] or not raw["ids"][0]:
+        return [], [], [], []
+    return raw["ids"][0], raw["documents"][0], raw["metadatas"][0], raw["distances"][0]
+
+
+def _bm25_pull(col, content: str, n: int):
+    """Top-N by BM25 over the entire palace. Returns (ids, docs, metas, raw_scores).
+
+    Pulls all drawers from the collection (Chroma get with no filter), scores
+    each by Okapi-BM25 against the query content, returns top-N by BM25 score.
+    For palaces of ~10K drawers this is O(N) tokenization + scoring, ~few
+    hundred ms. Acceptable at write time.
+
+    BM25 runs over header-stripped content so shared typed-memory boilerplate
+    (author/type/date/source/status) doesn't drive matches. Returned docs
+    are the FULL original (callers may still need the header for display).
+    Raw scores are computed against the FULL corpus and are reused for the
+    BM25-only raw-floor gate; do not recompute that floor over the small union
+    because `_bm25_scores` computes IDF over the provided document set.
+    """
+    all_ = col.get(include=["documents", "metadatas"])
+    if not all_["ids"]:
+        return [], [], [], []
+    docs = all_["documents"]
+    stripped_query = _strip_typed_header(content)
+    stripped_docs = [_strip_typed_header(d) for d in docs]
+    bm25_raw = _bm25_scores(stripped_query, stripped_docs)
+    indexed = sorted(
+        range(len(docs)),
+        key=lambda i: bm25_raw[i],
+        reverse=True,
+    )[:n]
+    ids = [all_["ids"][i] for i in indexed]
+    out_docs = [docs[i] for i in indexed]
+    out_metas = [all_["metadatas"][i] for i in indexed]
+    out_raw_scores = [bm25_raw[i] for i in indexed]
+    return ids, out_docs, out_metas, out_raw_scores
+
+
+def rank_candidates(
+    *,
+    content: str,
+    wing: str,
+    room: str,
+    type_: str,
+    threshold: float,
+    advisory_floor: float,
+    n_results: int = 20,
+) -> RetrievalResult:
+    """Run hybrid retrieval against the active palace; return blocking + advisory splits."""
+    from mempalace import mcp_server
+
+    col = mcp_server._get_collection()
+    if not col or col.count() == 0:
+        return RetrievalResult(blocking=[], advisory=[])
+
+    # 1. Vector pull (top-K by Chroma embedding distance)
+    vec_ids, vec_docs, vec_metas, vec_distances = _vector_pull(col, content, n_results)
+
+    # 2. BM25-only pull (top-K by lexical match over the entire corpus)
+    bm25_ids, bm25_docs, bm25_metas, bm25_full_raw = _bm25_pull(col, content, n_results)
+
+    # 3. Union: dedupe by drawer_id, preserving first-seen ordering for stability
+    union_ids: list = []
+    union_docs: dict = {}
+    union_metas: dict = {}
+    union_distances: dict = {}  # drawer_id → distance (only set for vector hits)
+    bm25_full_raw_by_id: dict = {}  # drawer_id → full-corpus raw BM25 score
+
+    for i, did in enumerate(vec_ids):
+        if did not in union_docs:
+            union_ids.append(did)
+            union_docs[did] = vec_docs[i]
+            union_metas[did] = vec_metas[i] or {}
+            union_distances[did] = vec_distances[i]
+    for i, did in enumerate(bm25_ids):
+        bm25_full_raw_by_id[did] = bm25_full_raw[i]
+        if did not in union_docs:
+            union_ids.append(did)
+            union_docs[did] = bm25_docs[i]
+            union_metas[did] = bm25_metas[i] or {}
+            # No vector distance for BM25-only candidates; treat vec_sim as 0 below
+
+    if not union_ids:
+        return RetrievalResult(blocking=[], advisory=[])
+
+    # 4. BM25 over the union — both raw (for absolute gate) and normalized
+    #    (for hybrid scoring with vector signal). Run BM25 on header-stripped
+    #    content so shared typed-memory boilerplate doesn't drive scores.
+    stripped_query = _strip_typed_header(content)
+    union_stripped = [_strip_typed_header(union_docs[did]) for did in union_ids]
+    bm25_union = _bm25_scores(stripped_query, union_stripped)
+    bm25_raw_by_id = {did: bm25_union[i] for i, did in enumerate(union_ids)}
+    max_bm25 = max(bm25_union) if bm25_union and max(bm25_union) > 0 else 1.0
+    bm25_norm_by_id = {did: (bm25_union[i] / max_bm25) for i, did in enumerate(union_ids)}
+
+    # 4b. BM25-only quality gates (Codex v1.3 review).
+    #
+    # Without these gates, a query like "DO use the thing" would surface ANY
+    # candidate sharing the words "do", "use", "the" with bm25_norm = 1.0
+    # (because corpus-relative normalization makes the "best in pool" candidate
+    # 1.0 regardless of raw signal). Two gates filter out "best in a weak pool":
+    #
+    #   (a) Raw BM25 floor: real lexical similarity scores raw >= ~2.0 with
+    #       Lucene+ IDF over the FULL corpus; below that means just one or two
+    #       common-ish tokens matched. Tunable via _MIN_BM25_RAW.
+    #   (b) Distinctive-token overlap: at least one matched token must be
+    #       4+ chars (filters "do", "use", "the", "is"). Aligns with how the
+    #       existing _bm25_only_via_sqlite filters trigram-len tokens.
+    #
+    # BM25-only candidates that fail either gate are dropped from the result.
+    # Vector-found candidates are kept regardless (vector similarity carries
+    # its own signal).
+    # Distinctive tokens computed over header-stripped query — boilerplate
+    # tokens like "claude", "evidence", "confirmed" must not count as
+    # distinctive overlap.
+    distinctive_query_tokens = {t for t in _tokenize(stripped_query) if len(t) >= 4}
+    bm25_only_passes_gate = {}
+    for did in union_ids:
+        if did in union_distances:
+            # Vector hit: skip BM25 gating
+            bm25_only_passes_gate[did] = True
+            continue
+        raw = bm25_full_raw_by_id.get(did, bm25_raw_by_id[did])
+        if raw < _MIN_BM25_RAW:
+            bm25_only_passes_gate[did] = False
+            continue
+        # Candidate tokens also computed over header-stripped body
+        cand_tokens = set(_tokenize(_strip_typed_header(union_docs[did])))
+        if not (distinctive_query_tokens & cand_tokens):
+            bm25_only_passes_gate[did] = False
+            continue
+        bm25_only_passes_gate[did] = True
+
+    # 5. Identifier-token boost (write-guard specific)
+    query_techs = _extract_tech_tokens(content)
+    tech_boost_by_id = {}
+    for did in union_ids:
+        doc_techs = _extract_tech_tokens(union_docs[did])
+        overlap = query_techs & doc_techs
+        tech_boost_by_id[did] = 0.05 * min(len(overlap), 3)  # cap boost at 0.15
+
+    # 6. Combine + wing/room/type-aware adjustment
+    #
+    # Score formula: max-primary + small-secondary-boost, NOT weighted sum.
+    # Reason: with weighted sum (0.6*vec + 0.3*bm25), a BM25-only candidate
+    # (vec_sim=0) caps at ~0.48, below the default advisory floor (0.5) — so
+    # the BM25 union becomes mathematically inert. The max-primary form lets
+    # EITHER signal alone hit the blocking threshold, with a small lift when
+    # both fire. (Codex caught this in the v1.2 review.)
+    #
+    # BM25-only candidates that fail the quality gates (raw floor + distinctive
+    # token) are skipped here so they don't surface as blocking despite having
+    # only common-token overlap. (Codex caught this in the v1.3 review.)
+    candidates = []
+    for did in union_ids:
+        # Skip BM25-only candidates that didn't pass the quality gates
+        if not bm25_only_passes_gate.get(did, True):
+            continue
+
+        meta = union_metas[did]
+        cand_wing = meta.get("wing", "")
+        cand_room = meta.get("room", "")
+        body = union_docs[did]
+        cand_type = _parse_drawer_type(body)
+
+        # vec_sim: from distance if vector pool found it; else 0 (BM25-only candidate)
+        if did in union_distances:
+            vec_sim = max(0.0, 1 - union_distances[did])
+        else:
+            vec_sim = 0.0
+
+        bm25 = bm25_norm_by_id[did]
+
+        # Max-primary scoring: either signal alone can be sufficient;
+        # both firing gives a small additive lift.
+        primary = max(vec_sim, bm25)
+        secondary = min(vec_sim, bm25)
+        score = primary + 0.15 * secondary + tech_boost_by_id[did]
+
+        # Wing/room/type-aware adjustment
+        if cand_wing != wing:
+            if cand_type not in ("contradiction", "resolution"):
+                score -= 0.05
+        elif cand_room == room:
+            score += 0.03
+
+        score = max(0.0, min(1.0, score))
+        title = body.split("\n", 1)[0][:200]
+
+        candidates.append(Candidate(
+            drawer_id=did,
+            title=title,
+            body=body,
+            wing=cand_wing,
+            room=cand_room,
+            type=cand_type,
+            similarity=round(score, 3),
+        ))
+
+    candidates.sort(key=lambda c: c.similarity, reverse=True)
+
+    blocking = [c for c in candidates if c.similarity >= threshold]
+    advisory = [c for c in candidates if advisory_floor <= c.similarity < threshold]
+
+    return RetrievalResult(blocking=blocking, advisory=advisory)

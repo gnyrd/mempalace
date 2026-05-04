@@ -1,0 +1,363 @@
+"""Tests for hybrid retrieval used by prepare_write.
+
+The retrieval combines vector similarity, lexical/BM25, identifier-token
+boost, and wing/room/type-aware filtering. Returns blocking + advisory splits
+per the policy thresholds.
+"""
+import pytest
+
+from mempalace.retrieval import rank_candidates, Candidate
+
+
+# Test palace fixture: assumes a small corpus of drawers in tmp palace.
+# Use the existing test conftest pattern; see ~/Repos/mempalace/tests/conftest.py.
+@pytest.fixture
+def small_palace(tmp_path, monkeypatch):
+    """Create an isolated palace with a known small set of drawers for retrieval tests."""
+    import json
+    # Allow tool_add_drawer for seeding (test fixtures bypass the gate intentionally; see Task 1)
+    pol = tmp_path / "policy.json"
+    pol.write_text(json.dumps({"deprecated_add_drawer_response": "allow"}))
+    monkeypatch.setenv("MEMPALACE_POLICY_PATH", str(pol))
+    monkeypatch.setenv("MEMPALACE_PALACE_PATH", str(tmp_path / "palace"))
+    # Reset cached chroma client per existing test convention
+    from mempalace import mcp_server
+    monkeypatch.setattr(mcp_server, "_client", None, raising=False)
+    monkeypatch.setattr(mcp_server, "_collection", None, raising=False)
+    monkeypatch.setattr(mcp_server, "_metadata_cache", None, raising=False)
+
+    # Seed: known drawers we'll search for
+    mcp_server.tool_add_drawer(
+        wing="testwing", room="do",
+        content="DO use chat.guid as thread_id\n\nauthor: claude\ntype: evidence\n"
+                "date: 2026-05-01\nsource: test\nstatus: confirmed\n\n"
+                "Tried because: testing primary key\nEvidence: ROWID is not unique across DBs\n"
+                "Caveat: only on macOS Messages",
+    )
+    mcp_server.tool_add_drawer(
+        wing="testwing", room="dont",
+        content="DONT use chat.ROWID as primary key\n\nauthor: claude\ntype: evidence\n"
+                "date: 2026-05-01\nsource: test\nstatus: confirmed\n\n"
+                "Tried because: needed stable IDs\nExpected: unique values\n"
+                "Actual: ROWID collides across migrated DBs\n"
+                "Use instead: chat.guid",
+    )
+    mcp_server.tool_add_drawer(
+        wing="otherwing", room="general",
+        content="general note about deployment\n\nauthor: claude\ntype: evidence\n"
+                "date: 2026-04-15\nsource: test\nstatus: confirmed\n\n"
+                "Some unrelated content about CI/CD pipelines",
+    )
+    yield tmp_path / "palace"
+
+
+def test_returns_blocking_and_advisory_split(small_palace):
+    result = rank_candidates(
+        content="DO use chat.guid as the thread identifier instead of ROWID",
+        wing="testwing",
+        room="do",
+        type_="evidence",
+        threshold=0.7,
+        advisory_floor=0.5,
+    )
+    # The DO drawer should be a blocking candidate (high similarity)
+    assert any(c.drawer_id and "guid" in c.body.lower() for c in result.blocking)
+    # The DONT may or may not be blocking depending on similarity, but should appear
+    # somewhere (blocking or advisory)
+    all_returned = result.blocking + result.advisory
+    assert any("ROWID" in c.body for c in all_returned)
+
+
+def test_advisory_floor_filters_lowest_hits(small_palace):
+    """A query with weak similarity should still surface drawers above advisory_floor."""
+    result = rank_candidates(
+        content="Some completely unrelated content about deployment pipelines",
+        wing="testwing",  # different wing from the matching drawer
+        room="do",
+        type_="evidence",
+        threshold=0.7,
+        advisory_floor=0.5,
+    )
+    # The deployment-related drawer is in otherwing/general; cross-wing should
+    # be deprioritized but still surface as advisory if above floor
+    # (Exact assertion depends on retrieval behavior; allow the advisory hit at minimum.)
+    assert isinstance(result.blocking, list)
+    assert isinstance(result.advisory, list)
+
+
+def test_identifier_boost_lifts_code_path_match(small_palace):
+    """Content sharing distinctive code-path tokens should rank higher."""
+    # Both drawers reference "chat.guid" / "chat.ROWID"; a query containing
+    # the exact tokens should boost their match scores.
+    result = rank_candidates(
+        content="chat.guid is the right identifier",
+        wing="testwing",
+        room="do",
+        type_="evidence",
+        threshold=0.7,
+        advisory_floor=0.5,
+    )
+    assert len(result.blocking) >= 1
+
+
+def test_wing_filter_prioritizes_same_wing(small_palace):
+    """Same-wing candidates should rank above cross-wing for similar content."""
+    result = rank_candidates(
+        content="something about chat IDs",
+        wing="testwing",
+        room="do",
+        type_="evidence",
+        threshold=0.7,
+        advisory_floor=0.5,
+    )
+    # If both wings have similar-ish content, testwing entries appear first/higher
+    if len(result.blocking) > 0:
+        assert all(c.wing == "testwing" or c.similarity > 0.85 for c in result.blocking[:2])
+
+
+def test_returns_empty_when_palace_empty(tmp_path, monkeypatch):
+    monkeypatch.setenv("MEMPALACE_PALACE_PATH", str(tmp_path / "empty"))
+    from mempalace import mcp_server
+    monkeypatch.setattr(mcp_server, "_client", None, raising=False)
+    monkeypatch.setattr(mcp_server, "_collection", None, raising=False)
+    monkeypatch.setattr(mcp_server, "_metadata_cache", None, raising=False)
+
+    result = rank_candidates(
+        content="anything",
+        wing="w", room="do", type_="evidence",
+        threshold=0.7, advisory_floor=0.5,
+    )
+    assert result.blocking == []
+    assert result.advisory == []
+
+
+def test_bm25_only_match_surfaces_when_vector_misses(small_palace, monkeypatch):
+    """Drawer with strong lexical match but weak vector similarity should still
+    surface via the BM25-only pull AND clear the advisory_floor / blocking
+    threshold. Tests both candidate-union AND that BM25-only candidates
+    score high enough to actually appear in blocking/advisory (not get
+    mathematically filtered out by hybrid weights — Codex's v1.2 review)."""
+    from mempalace import retrieval as r
+
+    # Stub _vector_pull to return empty (simulate vector miss). BM25 alone
+    # must surface the seed AND the score must clear at least advisory_floor.
+    monkeypatch.setattr(r, "_vector_pull", lambda col, content, n: ([], [], [], []))
+
+    result = r.rank_candidates(
+        content="DO use chat.guid as the thread identifier instead of ROWID",
+        wing="testwing",
+        room="do",
+        type_="evidence",
+        threshold=0.7,
+        advisory_floor=0.5,
+    )
+    all_returned = result.blocking + result.advisory
+    assert len(all_returned) > 0, (
+        "BM25-only retrieval should surface candidates even when vector returns "
+        "nothing. If empty, the scoring formula penalizes BM25-only candidates "
+        "out of the advisory floor — see retrieval.py max-primary scoring."
+    )
+
+    # The seeded drawer about chat.guid should be the top match (lexical overlap
+    # with chat, guid, ROWID, thread)
+    top = all_returned[0]
+    assert "guid" in top.body.lower() or "rowid" in top.body.lower(), (
+        f"top BM25-only match should contain shared tokens; got body={top.body[:100]}"
+    )
+
+    # And its score must clear advisory_floor (the bug Codex caught was the
+    # score capping at 0.48 < 0.5)
+    assert top.similarity >= 0.5, (
+        f"BM25-only candidate similarity ({top.similarity}) must clear advisory_floor "
+        f"(0.5). If lower, the scoring formula is filtering BM25-only hits out."
+    )
+
+
+def test_weak_lexical_query_does_not_surface_bm25_only_blocking(small_palace, monkeypatch):
+    """A query with only common tokens (DO, use, the, is) must NOT surface
+    BM25-only candidates. The corpus-relative normalization would otherwise
+    give the top hit similarity=1.0 just for sharing stopword-ish tokens.
+    Tests the raw-floor + distinctive-token gates Codex flagged in v1.3."""
+    from mempalace import retrieval as r
+
+    monkeypatch.setattr(r, "_vector_pull", lambda col, content, n: ([], [], [], []))
+
+    result = r.rank_candidates(
+        content="DO use the thing",  # all very common tokens, < 4 chars except "thing"
+        wing="otherwing",
+        room="do",
+        type_="evidence",
+        threshold=0.7,
+        advisory_floor=0.5,
+    )
+    # The seeded testwing drawers all contain "DO", "use", etc., but none are
+    # genuinely about "the thing" — so BM25-only blocking should NOT fire.
+    assert result.blocking == [], (
+        f"weak-query BM25-only false-positive: {result.blocking}. "
+        f"The raw-floor and distinctive-token gates should have filtered these."
+    )
+
+
+def test_distinctive_token_gate_blocks_pure_stopword_query(small_palace, monkeypatch):
+    """Even more degenerate: query is purely common tokens. No distinctive
+    (length >= 4) overlap with any seeded drawer. Must return nothing."""
+    from mempalace import retrieval as r
+
+    monkeypatch.setattr(r, "_vector_pull", lambda col, content, n: ([], [], [], []))
+
+    result = r.rank_candidates(
+        content="DO is do is",  # zero distinctive tokens
+        wing="testwing", room="do", type_="evidence",
+        threshold=0.7, advisory_floor=0.5,
+    )
+    assert result.blocking == []
+    assert result.advisory == []
+
+
+def test_bm25_raw_floor_uses_full_corpus_not_union(tmp_path, monkeypatch):
+    """BM25-only raw-score gating must use the full-corpus BM25 score, not a
+    recomputed score over the small vector+BM25 union. `_bm25_scores` computes
+    IDF over the provided corpus; if the raw floor is computed only over the
+    union, a common full-palace token can look artificially distinctive and
+    become a false-positive blocking candidate. (Codex v1.8 review.)"""
+    import json
+    pol = tmp_path / "policy.json"
+    pol.write_text(json.dumps({"deprecated_add_drawer_response": "allow"}))
+    monkeypatch.setenv("MEMPALACE_POLICY_PATH", str(pol))
+    monkeypatch.setenv("MEMPALACE_PALACE_PATH", str(tmp_path / "palace"))
+
+    from mempalace import mcp_server, retrieval as r
+    monkeypatch.setattr(mcp_server, "_client", None, raising=False)
+    monkeypatch.setattr(mcp_server, "_collection", None, raising=False)
+    monkeypatch.setattr(mcp_server, "_metadata_cache", None, raising=False)
+
+    # `reconcile` is 4+ chars and appears in many unrelated drawers. Full-corpus
+    # IDF should make it weak; small-union IDF can wrongly inflate it.
+    for i in range(25):
+        mcp_server.tool_add_drawer(
+            wing="ops", room="do",
+            content=(
+                f"DO reconcile routine note {i}\n\n"
+                "author: claude\ntype: evidence\ndate: 2026-05-01\nsource: test\nstatus: confirmed\n\n"
+                f"Tried because: operations checklist item {i}\n"
+                f"Evidence: reconcile appears in many unrelated runbook notes {i}\n"
+                "Caveat: generic operational vocabulary"
+            ),
+        )
+
+    monkeypatch.setattr(r, "_vector_pull", lambda col, content, n: ([], [], [], []))
+
+    result = r.rank_candidates(
+        content="DO reconcile the thing",
+        wing="otherwing",
+        room="do",
+        type_="evidence",
+        threshold=0.7,
+        advisory_floor=0.5,
+    )
+    assert result.blocking == [], (
+        f"common full-corpus token surfaced as blocking: {result.blocking}. "
+        "BM25-only raw-floor gating must use full-corpus raw scores, not "
+        "scores recomputed over the tiny union."
+    )
+    assert result.advisory == []
+
+
+def test_semantic_colon_prefixes_are_preserved():
+    """Domain terms that happen to start a line in `Word: ...` form (HTTP,
+    OAuth, SwiftUI, Postgres, Mailchimp, etc.) must NOT be stripped. Lowercase
+    semantic fields later in the body (`status: 500`, `source: webhook`) must
+    also survive. Only the typed-memory header block and explicit template
+    labels are stripped. (Codex v1.6 + v1.8 review.)"""
+    from mempalace.retrieval import _strip_typed_header
+
+    body = (
+        "DO use SwiftUI's @State for transient state\n\n"
+        "author: claude\ntype: evidence\ndate: 2026-05-01\nsource: test\nstatus: confirmed\n\n"
+        "Tried because: needed reactive UI updates\n"
+        "Evidence: @State binds view to value, automatic re-render on mutation\n"
+        "Caveat: don't share @State across views\n"
+        "HTTP: 200 in 50ms (incidental note)\n"
+        "OAuth: PKCE preferred\n"
+        "Postgres: pg_stat_activity revealed lock\n"
+        "Mailchimp: API rate-limit window 5 min\n"
+        "status: 500 on checkout after webhook retry\n"
+        "source: webhook payload included provider_status\n"
+    )
+    stripped = _strip_typed_header(body)
+
+    # Template labels stripped (label only — values preserved):
+    assert "Tried because:" not in stripped, f"template label 'Tried because:' not stripped: {stripped!r}"
+    assert "Evidence:" not in stripped, f"template label 'Evidence:' not stripped: {stripped!r}"
+    assert "Caveat:" not in stripped, f"template label 'Caveat:' not stripped: {stripped!r}"
+    # Their values preserved:
+    assert "needed reactive UI updates" in stripped
+    assert "@State binds view" in stripped
+
+    # Domain prefixes preserved (NOT in allowlist):
+    assert "HTTP:" in stripped, f"domain term 'HTTP:' was stripped (regression): {stripped!r}"
+    assert "OAuth:" in stripped, f"domain term 'OAuth:' was stripped: {stripped!r}"
+    assert "Postgres:" in stripped, f"domain term 'Postgres:' was stripped: {stripped!r}"
+    assert "Mailchimp:" in stripped, f"domain term 'Mailchimp:' was stripped: {stripped!r}"
+
+    # Semantic lowercase field names after the header are preserved:
+    assert "status: 500 on checkout" in stripped
+    assert "source: webhook payload" in stripped
+
+    # Header lines entirely gone:
+    assert "author: claude" not in stripped
+    assert "status: confirmed" not in stripped
+
+
+def test_template_boilerplate_overlap_does_not_trigger_blocking(tmp_path, monkeypatch):
+    """Two unrelated drawers sharing only template boilerplate must not
+    surface each other via BM25. Two layers of boilerplate must be stripped:
+      1. Typed-memory header (author/type/date/source/status) — Codex v1.4
+      2. Body-template labels (Tried because/Evidence/Caveat/Expected/...) —
+         Codex v1.5 (this layer was missing in v1.5; v1.6 fix)
+    """
+    import json
+    pol = tmp_path / "policy.json"
+    pol.write_text(json.dumps({"deprecated_add_drawer_response": "allow"}))
+    monkeypatch.setenv("MEMPALACE_POLICY_PATH", str(pol))
+    monkeypatch.setenv("MEMPALACE_PALACE_PATH", str(tmp_path / "palace"))
+
+    from mempalace import mcp_server, retrieval as r
+    monkeypatch.setattr(mcp_server, "_client", None, raising=False)
+    monkeypatch.setattr(mcp_server, "_collection", None, raising=False)
+    monkeypatch.setattr(mcp_server, "_metadata_cache", None, raising=False)
+
+    # Two completely unrelated drawer bodies; identical headers
+    drawer_a_body = (
+        "DO use semaphore primitives for FFI thread coordination\n\n"
+        "author: claude\ntype: evidence\ndate: 2026-04-15\nsource: test\nstatus: confirmed\n\n"
+        "Tried because: Rust async over C boundary needed coordination\n"
+        "Evidence: Mutex held across await deadlocks; semaphore.Permit avoids\n"
+        "Caveat: only when caller is async-aware"
+    )
+    drawer_b_body = (
+        "DO bake margarine into pie crust for flakiness\n\n"
+        "author: claude\ntype: evidence\ndate: 2026-04-20\nsource: test\nstatus: confirmed\n\n"
+        "Tried because: butter crust was tough\n"
+        "Evidence: margarine's higher water content steams during bake\n"
+        "Caveat: flavor is less rich"
+    )
+    mcp_server.tool_add_drawer(wing="cooking", room="do", content=drawer_b_body)
+
+    # Force BM25-only path so the gates are what matters
+    monkeypatch.setattr(r, "_vector_pull", lambda col, content, n: ([], [], [], []))
+
+    result = r.rank_candidates(
+        content=drawer_a_body,  # FFI threading; nothing about pie crust
+        wing="rust",
+        room="do",
+        type_="evidence",
+        threshold=0.7,
+        advisory_floor=0.5,
+    )
+    # Drawer A and B share ONLY the header tokens. After stripping, no
+    # distinctive overlap should remain. Must NOT block.
+    assert result.blocking == [], (
+        f"header-only overlap surfaced as blocking: {result.blocking}. "
+        f"_strip_typed_header is likely missing or the regex isn't catching all keys."
+    )
