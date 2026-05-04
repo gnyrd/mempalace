@@ -203,7 +203,19 @@ def rank_candidates(
     advisory_floor: float,
     n_results: int = 20,
 ) -> RetrievalResult:
-    """Run hybrid retrieval against the active palace; return blocking + advisory splits."""
+    """Run hybrid retrieval against the active palace; return blocking + advisory splits.
+
+    `type_` is the type of the *incoming* write. In v1 it is captured by the
+    prepare token (so commit re-check can replay the same retrieval params)
+    and exposed in the API for forward compatibility, but it does NOT affect
+    retrieval scoring or visibility. Type-awareness in v1 is **candidate-side
+    only**: the cross-wing penalty is waived for candidate drawers whose own
+    `type` is `contradiction` or `resolution` (so a contradiction-resolution
+    pair stays linked across wings). A future task can add write-side
+    behavior (e.g., broaden retrieval when an agent writes a
+    contradiction/resolution) — that's deliberately deferred. (Codex v2.1
+    review documented this.)
+    """
     from mempalace import mcp_server
 
     col = mcp_server._get_collection()
@@ -250,7 +262,7 @@ def rank_candidates(
     max_bm25 = max(bm25_union) if bm25_union and max(bm25_union) > 0 else 1.0
     bm25_norm_by_id = {did: (bm25_union[i] / max_bm25) for i, did in enumerate(union_ids)}
 
-    # 4b. BM25-only quality gates (Codex v1.3 review).
+    # 4b. Lexical quality gates (Codex v1.3 + v2.1 review).
     #
     # Without these gates, a query like "DO use the thing" would surface ANY
     # candidate sharing the words "do", "use", "the" with bm25_norm = 1.0
@@ -264,29 +276,32 @@ def rank_candidates(
     #       4+ chars (filters "do", "use", "the", "is"). Aligns with how the
     #       existing _bm25_only_via_sqlite filters trigram-len tokens.
     #
-    # BM25-only candidates that fail either gate are dropped from the result.
-    # Vector-found candidates are kept regardless (vector similarity carries
-    # its own signal).
+    # **The gate controls TWO things, separately:**
+    #   (i)  candidate visibility — BM25-only candidates are dropped if the
+    #        gate fails (they have no other signal to carry them).
+    #   (ii) BM25 score contribution — a candidate's normalized BM25 only
+    #        feeds into scoring if the gate passes. This applies to vector
+    #        hits too: a weak-vec candidate with spurious common-token overlap
+    #        must not be promoted to blocking via the union-relative bm25_norm
+    #        when its full-corpus raw BM25 is below _MIN_BM25_RAW. (Codex v2.1
+    #        review caught the original bypass for vector hits.)
+    #
     # Distinctive tokens computed over header-stripped query — boilerplate
     # tokens like "claude", "evidence", "confirmed" must not count as
     # distinctive overlap.
     distinctive_query_tokens = {t for t in _tokenize(stripped_query) if len(t) >= 4}
-    bm25_only_passes_gate = {}
+    bm25_signal_passes_gate = {}  # gate decision for BM25 score contribution
     for did in union_ids:
-        if did in union_distances:
-            # Vector hit: skip BM25 gating
-            bm25_only_passes_gate[did] = True
-            continue
         raw = bm25_full_raw_by_id.get(did, bm25_raw_by_id[did])
         if raw < _MIN_BM25_RAW:
-            bm25_only_passes_gate[did] = False
+            bm25_signal_passes_gate[did] = False
             continue
         # Candidate tokens also computed over header-stripped body
         cand_tokens = set(_tokenize(_strip_typed_header(union_docs[did])))
         if not (distinctive_query_tokens & cand_tokens):
-            bm25_only_passes_gate[did] = False
+            bm25_signal_passes_gate[did] = False
             continue
-        bm25_only_passes_gate[did] = True
+        bm25_signal_passes_gate[did] = True
 
     # 5. Identifier-token boost (write-guard specific)
     query_techs = _extract_tech_tokens(content)
@@ -305,13 +320,21 @@ def rank_candidates(
     # EITHER signal alone hit the blocking threshold, with a small lift when
     # both fire. (Codex caught this in the v1.2 review.)
     #
-    # BM25-only candidates that fail the quality gates (raw floor + distinctive
-    # token) are skipped here so they don't surface as blocking despite having
-    # only common-token overlap. (Codex caught this in the v1.3 review.)
+    # Visibility vs BM25 contribution (Codex v1.3 + v2.1 review):
+    #   - BM25-only candidates that fail the lexical gate are dropped entirely
+    #     (no other signal carries them).
+    #   - Vector hits stay visible regardless (vector signal carries them),
+    #     but their BM25 contribution is zeroed when the lexical gate fails.
+    #     This prevents a weak-vec candidate from being promoted to blocking
+    #     via union-relative bm25_norm when full-corpus raw BM25 is below
+    #     _MIN_BM25_RAW.
     candidates = []
     for did in union_ids:
-        # Skip BM25-only candidates that didn't pass the quality gates
-        if not bm25_only_passes_gate.get(did, True):
+        is_vector_hit = did in union_distances
+        bm25_allowed = bm25_signal_passes_gate.get(did, False)
+
+        # BM25-only candidate that failed the gate: drop entirely.
+        if not is_vector_hit and not bm25_allowed:
             continue
 
         meta = union_metas[did]
@@ -321,12 +344,15 @@ def rank_candidates(
         cand_type = _parse_drawer_type(body)
 
         # vec_sim: from distance if vector pool found it; else 0 (BM25-only candidate)
-        if did in union_distances:
+        if is_vector_hit:
             vec_sim = max(0.0, 1 - union_distances[did])
         else:
             vec_sim = 0.0
 
-        bm25 = bm25_norm_by_id[did]
+        # BM25 contributes to scoring ONLY if the lexical gate passes.
+        # Applies to vector hits too — see "Visibility vs BM25 contribution"
+        # above.
+        bm25 = bm25_norm_by_id[did] if bm25_allowed else 0.0
 
         # Max-primary scoring: either signal alone can be sufficient;
         # both firing gives a small additive lift.

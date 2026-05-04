@@ -361,3 +361,101 @@ def test_template_boilerplate_overlap_does_not_trigger_blocking(tmp_path, monkey
         f"header-only overlap surfaced as blocking: {result.blocking}. "
         f"_strip_typed_header is likely missing or the regex isn't catching all keys."
     )
+
+
+def test_weak_vector_hit_with_common_lexical_overlap_does_not_block(small_palace, monkeypatch):
+    """A vector hit with low similarity must NOT be promoted to blocking by
+    union-relative normalized BM25 when the lexical signal would fail the
+    full-corpus raw-floor / distinctive-token gates.
+
+    Without the fix: a vector hit's BM25 against a tiny union can be 1.0
+    (best-in-pool) regardless of full-corpus IDF, so max(vec_sim=0.3, 1.0)
+    promotes the candidate above the 0.7 blocking threshold purely on common-
+    token overlap. With the fix: BM25 contributes 0 to scoring when the
+    lexical gate fails, so the score is just vec_sim ~= 0.3. (Codex v2.1
+    review.)
+    """
+    from mempalace import mcp_server, retrieval as r
+
+    def stub_low_sim_vector(col, content, n):
+        # Return one real seeded drawer at high distance (low vec_sim).
+        all_data = col.get(include=["documents", "metadatas"])
+        if not all_data["ids"]:
+            return [], [], [], []
+        return (
+            [all_data["ids"][0]],
+            [all_data["documents"][0]],
+            [all_data["metadatas"][0]],
+            [0.7],  # distance 0.7 -> vec_sim 0.3
+        )
+
+    monkeypatch.setattr(r, "_vector_pull", stub_low_sim_vector)
+
+    result = r.rank_candidates(
+        # All tokens are common; "thing" is the only distinctive (>=4 char)
+        # token and it does NOT appear in any seeded drawer body. So the
+        # distinctive-token gate fails. Without the fix, the lone vector
+        # candidate's normalized BM25 = 1.0 (best in pool of 1) and gets
+        # promoted via max(0.3, 1.0).
+        content="DO use the thing",
+        wing="testwing",
+        room="do",
+        type_="evidence",
+        threshold=0.7,
+        advisory_floor=0.5,
+    )
+
+    blocking_ids = [c.drawer_id for c in result.blocking]
+    assert blocking_ids == [], (
+        f"weak vector hit (vec_sim=0.3) was promoted to blocking via "
+        f"common-token BM25 overlap: {result.blocking}. The full-corpus "
+        f"raw BM25 floor and distinctive-token gates must suppress the "
+        f"BM25 contribution to scoring for vector hits as well, not just "
+        f"BM25-only candidates."
+    )
+
+
+def test_incoming_type_does_not_change_retrieval(small_palace):
+    """v1 type-awareness is candidate-side only: changing the incoming `type_`
+    parameter must not change which candidates surface or their order. The
+    cross-wing exception is determined by the CANDIDATE drawer's type
+    (contradiction/resolution), not by what the agent declares for the
+    incoming write. The `type_` parameter is captured in the prepare token
+    for commit re-check replay but does not feed retrieval scoring.
+
+    If a future task adds write-side type behavior, this test will need to
+    update — and the docstring on rank_candidates should be updated in the
+    same change. (Codex v2.1 review documented this v1 behavior.)
+    """
+    from mempalace import retrieval as r
+
+    common_kwargs = dict(
+        content="DO use chat.guid as the thread identifier instead of ROWID",
+        wing="testwing",
+        room="do",
+        threshold=0.7,
+        advisory_floor=0.5,
+    )
+
+    res_evidence = r.rank_candidates(type_="evidence", **common_kwargs)
+    res_contradiction = r.rank_candidates(type_="contradiction", **common_kwargs)
+    res_resolution = r.rank_candidates(type_="resolution", **common_kwargs)
+
+    def fingerprint(res):
+        # (drawer_id, similarity) pairs across both buckets, preserving order
+        return [(c.drawer_id, c.similarity) for c in res.blocking + res.advisory]
+
+    fp_e = fingerprint(res_evidence)
+    fp_c = fingerprint(res_contradiction)
+    fp_r = fingerprint(res_resolution)
+
+    assert fp_e == fp_c == fp_r, (
+        f"changing incoming type_ changed retrieval results.\n"
+        f"  evidence:      {fp_e}\n"
+        f"  contradiction: {fp_c}\n"
+        f"  resolution:    {fp_r}\n"
+        f"v1 type-awareness is candidate-side only — the incoming type_ "
+        f"is captured but must not influence scoring. If this test fails "
+        f"because behavior changed intentionally, also update the "
+        f"rank_candidates docstring."
+    )

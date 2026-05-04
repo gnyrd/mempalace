@@ -169,6 +169,23 @@ def validate_commit_args(
     if fate not in Fate.ALL:
         raise ValidationError(f"unknown fate: {fate!r}")
 
+    # Shape: each candidate_relations entry must be a dict with drawer_id +
+    # relation. Without this, malformed entries surface as bare KeyError to
+    # MCP callers instead of typed ValidationError. (Codex v2.1 review.)
+    for i, r in enumerate(candidate_relations):
+        if not isinstance(r, dict):
+            raise ValidationError(
+                f"candidate_relations[{i}] must be a dict, got {type(r).__name__}: {r!r}"
+            )
+        if "drawer_id" not in r:
+            raise ValidationError(
+                f"candidate_relations[{i}] missing required key 'drawer_id': {r!r}"
+            )
+        if "relation" not in r:
+            raise ValidationError(
+                f"candidate_relations[{i}] missing required key 'relation': {r!r}"
+            )
+
     # Coverage: every blocking candidate addressed exactly once
     addressed = [r["drawer_id"] for r in candidate_relations]
     blocking = list(blocking_ids)

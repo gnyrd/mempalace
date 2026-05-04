@@ -178,3 +178,39 @@ def test_update_existing_passes():
         blocking_ids=["a", "b"],
         merged_content="merged content here",
     )
+
+
+# Shape validation: malformed candidate_relations entries must surface as
+# typed ValidationError rather than bare KeyError. Important because Task 9
+# will wire validate_commit_args into tool_commit_write, where bare
+# KeyError would surface as an unstructured MCP error. (Codex v2.1 review.)
+
+
+def test_missing_drawer_id_raises_validation_error():
+    with pytest.raises(ValidationError, match="missing required key 'drawer_id'"):
+        validate_commit_args(
+            fate=Fate.CREATE_NEW,
+            candidate_relations=[{"relation": Relation.SUPERSEDES}],
+            blocking_ids=["a"],
+            merged_content=None,
+        )
+
+
+def test_missing_relation_raises_validation_error():
+    with pytest.raises(ValidationError, match="missing required key 'relation'"):
+        validate_commit_args(
+            fate=Fate.CREATE_NEW,
+            candidate_relations=[{"drawer_id": "a"}],
+            blocking_ids=["a"],
+            merged_content=None,
+        )
+
+
+def test_non_dict_candidate_entry_raises_validation_error():
+    with pytest.raises(ValidationError, match="must be a dict"):
+        validate_commit_args(
+            fate=Fate.CREATE_NEW,
+            candidate_relations=["not a dict"],
+            blocking_ids=["a"],
+            merged_content=None,
+        )
