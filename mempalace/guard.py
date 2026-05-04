@@ -108,3 +108,128 @@ class TokenStore:
 
     def size(self) -> int:
         return len(self._tokens)
+
+
+# ============================================================================
+# Fate / Relation enums
+# ============================================================================
+
+
+class Fate:
+    CREATE_NEW = "create_new"
+    SKIP_NEW = "skip_new"
+    UPDATE_EXISTING = "update_existing"
+
+    ALL = (CREATE_NEW, SKIP_NEW, UPDATE_EXISTING)
+
+
+class Relation:
+    DUPLICATE = "duplicate"
+    SUPERSEDES = "supersedes"
+    RESOLVES_CONTRADICTION = "resolves_contradiction"
+    RELATED_DISTINCT = "related_distinct"
+    STRENGTHENS_TARGET = "strengthens_target"
+    IGNORED_SPURIOUS = "ignored_spurious"
+
+    ALL = (
+        DUPLICATE,
+        SUPERSEDES,
+        RESOLVES_CONTRADICTION,
+        RELATED_DISTINCT,
+        STRENGTHENS_TARGET,
+        IGNORED_SPURIOUS,
+    )
+
+    # Relations that imply a new drawer is being created
+    CREATING = (SUPERSEDES, RESOLVES_CONTRADICTION, RELATED_DISTINCT, IGNORED_SPURIOUS)
+    # Relations that imply NO new drawer
+    NON_CREATING = (DUPLICATE, STRENGTHENS_TARGET)
+
+
+# ============================================================================
+# Validation
+# ============================================================================
+
+
+class ValidationError(ValueError):
+    """Raised when commit_write arguments fail fate/relation validation."""
+
+
+def validate_commit_args(
+    *,
+    fate: str,
+    candidate_relations: list,
+    blocking_ids: list,
+    merged_content: Optional[str],
+) -> None:
+    """Validate fate + candidate_relations + merged_content per the spec.
+
+    Raises ValidationError on any rule violation. Returns None on success.
+    """
+    if fate not in Fate.ALL:
+        raise ValidationError(f"unknown fate: {fate!r}")
+
+    # Coverage: every blocking candidate addressed exactly once
+    addressed = [r["drawer_id"] for r in candidate_relations]
+    blocking = list(blocking_ids)
+    seen = set()
+    for did in addressed:
+        if did in seen:
+            raise ValidationError(f"candidate {did!r} addressed twice")
+        seen.add(did)
+        if did not in blocking:
+            raise ValidationError(f"candidate {did!r} not in blocking_candidates")
+    missing = [b for b in blocking if b not in seen]
+    if missing:
+        raise ValidationError(f"blocking candidates not addressed: {missing}")
+
+    # Per-relation shape: related_distinct requires association
+    for r in candidate_relations:
+        rel = r["relation"]
+        if rel not in Relation.ALL:
+            raise ValidationError(f"unknown relation: {rel!r}")
+        if rel == Relation.RELATED_DISTINCT and not r.get("association"):
+            raise ValidationError(
+                f"relation 'related_distinct' on {r['drawer_id']!r} requires association"
+            )
+
+    relations_used = {r["relation"] for r in candidate_relations}
+
+    # Fate-vs-relation consistency
+    if fate == Fate.CREATE_NEW:
+        bad = relations_used & set(Relation.NON_CREATING)
+        if bad:
+            for b in bad:
+                raise ValidationError(
+                    f"relation {b!r} not allowed with fate=create_new "
+                    f"(it implies no new drawer); use fate=skip_new or update_existing"
+                )
+
+    elif fate == Fate.SKIP_NEW:
+        if Relation.DUPLICATE not in relations_used:
+            raise ValidationError(
+                "fate=skip_new requires at least one relation=duplicate"
+            )
+        allowed = {Relation.DUPLICATE, Relation.IGNORED_SPURIOUS}
+        if relations_used - allowed:
+            raise ValidationError(
+                "fate=skip_new permits only relations in "
+                "{duplicate, ignored_spurious}"
+            )
+        if merged_content is not None:
+            raise ValidationError("merged_content must be absent for fate=skip_new")
+
+    elif fate == Fate.UPDATE_EXISTING:
+        strengthens = [r for r in candidate_relations if r["relation"] == Relation.STRENGTHENS_TARGET]
+        if len(strengthens) != 1:
+            raise ValidationError(
+                "fate=update_existing requires exactly one strengthens_target relation"
+            )
+        allowed = {Relation.STRENGTHENS_TARGET, Relation.IGNORED_SPURIOUS}
+        if relations_used - allowed:
+            raise ValidationError(
+                "fate=update_existing permits only relations in "
+                "{strengthens_target, ignored_spurious}"
+            )
+        if not merged_content:
+            raise ValidationError("merged_content required for fate=update_existing")
