@@ -2416,16 +2416,53 @@ def handle_request(request):
 
 
 def _restore_stdout():
-    """Restore real stdout for MCP JSON-RPC output (see issue #225)."""
+    """Restore real stdout for MCP JSON-RPC output (see issue #225).
+
+    Keeps ``_REAL_STDOUT_FD`` open as a persistent reference. Some C-level
+    transitive deps (chromadb -> onnxruntime + CoreMLExecutionProvider on
+    macOS in particular) silently re-clobber fd 1 during embedding-function
+    init at first tool-call time. Once that happens, ``sys.stdout.write``
+    leaks JSON-RPC frames to stderr and the MCP transport hangs forever
+    from the client's view (Connection closed after timeout). Keeping the
+    saved fd alive lets ``_emit_jsonrpc`` write directly via ``os.write``,
+    bypassing fd 1 entirely.
+    """
     global _REAL_STDOUT, _REAL_STDOUT_FD
     if _REAL_STDOUT_FD is not None:
         try:
             os.dup2(_REAL_STDOUT_FD, 1)
-            os.close(_REAL_STDOUT_FD)
         except OSError:
             pass
-        _REAL_STDOUT_FD = None
+        # Intentionally NOT closing _REAL_STDOUT_FD — _emit_jsonrpc uses it
+        # as a clobber-immune handle on the original stdout pipe.
     sys.stdout = _REAL_STDOUT
+
+
+def _emit_jsonrpc(response):
+    """Write a JSON-RPC response line to the original stdout pipe.
+
+    Bypasses ``sys.stdout`` and fd 1 to defend against transitive C-level
+    fd-1 clobbers (see ``_restore_stdout`` docstring). When the saved fd is
+    unavailable (some test harnesses without fd-level stdio), falls back to
+    the Python-level stream — that path is best-effort and matches legacy
+    behavior.
+    """
+    payload = (json.dumps(response) + "\n").encode("utf-8")
+    if _REAL_STDOUT_FD is not None:
+        try:
+            # os.write may return short under EAGAIN/EINTR even on a blocking
+            # fd; loop until the full payload is flushed.
+            view = memoryview(payload)
+            while view:
+                written = os.write(_REAL_STDOUT_FD, view)
+                if written <= 0:
+                    break
+                view = view[written:]
+            return
+        except OSError:
+            pass
+    sys.stdout.write(payload.decode("utf-8"))
+    sys.stdout.flush()
 
 
 def main():
@@ -2446,8 +2483,7 @@ def main():
             request = json.loads(line)
             response = handle_request(request)
             if response is not None:
-                sys.stdout.write(json.dumps(response) + "\n")
-                sys.stdout.flush()
+                _emit_jsonrpc(response)
         except KeyboardInterrupt:
             break
         except Exception as e:
