@@ -52,6 +52,7 @@ from pathlib import Path  # noqa: E402
 
 from .config import (  # noqa: E402
     MempalaceConfig,
+    normalize_wing_name,
     sanitize_kg_value,
     sanitize_name,
     sanitize_content,
@@ -729,6 +730,13 @@ def tool_prepare_write(
     from mempalace.policy import load_policy
     from mempalace.retrieval import rank_candidates
 
+    try:
+        wing = sanitize_name(wing, "wing")
+        room = sanitize_name(room, "room")
+    except ValueError as e:
+        return {"error": str(e)}
+    wing = normalize_wing_name(wing)
+
     pol = load_policy()
     eff_threshold = threshold if threshold is not None else pol.default_threshold
     eff_advisory_floor = pol.advisory_floor
@@ -1074,6 +1082,8 @@ def tool_create_tunnel(
         target_room = sanitize_name(target_room, "target_room")
     except ValueError as e:
         return {"error": str(e)}
+    source_wing = normalize_wing_name(source_wing)
+    target_wing = normalize_wing_name(target_wing)
     return create_tunnel(
         source_wing,
         source_room,
@@ -1154,6 +1164,7 @@ def _tool_add_drawer_unguarded(
         content = sanitize_content(content)
     except ValueError as e:
         return {"success": False, "error": str(e)}
+    wing = normalize_wing_name(wing)
 
     col = _get_collection(create=True)
     if not col:
