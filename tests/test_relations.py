@@ -132,6 +132,85 @@ def test_apply_relation_related_distinct_from_new(palace_with_drawers):
     assert any(o["op"] == "create_tunnel" for o in op_log)
 
 
+def test_apply_relation_related_distinct_multiple_targets_same_room_persist(
+    palace_with_drawers,
+):
+    """Regression 5: when a new drawer has multiple `related_distinct`
+    candidates that live in the same target wing+room, ALL their tunnels
+    must persist with distinct ids. Reproduces the C3 / save-session
+    write-guard collision: two related_distinct ops collapsed to one
+    tunnel record on disk; the second silently overwrote the first.
+
+    See vault planning doc 2026-05-04-mempalace-tunnel-id-audit-oddity.md.
+    """
+    from mempalace import mcp_server, guard
+
+    tmp, _, _ = palace_with_drawers
+
+    # Two seed targets in the SAME wing/room but different drawers.
+    t1 = mcp_server.tool_add_drawer(
+        wing="testwing", room="general",
+        content="GENERAL one\n\nauthor: claude\ntype: evidence\ndate: 2026-05-01\n"
+                "source: test\nstatus: confirmed\n\nbody T1",
+    )
+    t2 = mcp_server.tool_add_drawer(
+        wing="testwing", room="general",
+        content="GENERAL two\n\nauthor: claude\ntype: evidence\ndate: 2026-05-01\n"
+                "source: test\nstatus: confirmed\n\nbody T2",
+    )
+    t1_id = t1["drawer_id"]
+    t2_id = t2["drawer_id"]
+
+    # New drawer that will tunnel to both.
+    new = mcp_server.tool_add_drawer(
+        wing="testwing", room="do",
+        content="DO new\n\nauthor: claude\ntype: evidence\ndate: 2026-05-04\n"
+                "source: test\nstatus: confirmed\n\nbody NEW",
+    )
+    new_id = new["drawer_id"]
+
+    # Two related_distinct ops, each with a different target in the same
+    # target wing/room. This is what commit_write does when iterating
+    # candidate_relations.
+    log1 = guard.apply_relation(
+        relation=guard.Relation.RELATED_DISTINCT,
+        target_drawer_id=t1_id,
+        new_drawer_id=new_id,
+        association={"kind": "tunnel", "direction": "from_new"},
+        merged_content=None,
+    )
+    log2 = guard.apply_relation(
+        relation=guard.Relation.RELATED_DISTINCT,
+        target_drawer_id=t2_id,
+        new_drawer_id=new_id,
+        association={"kind": "tunnel", "direction": "from_new"},
+        merged_content=None,
+    )
+
+    # Both ops claim a tunnel was created.
+    assert any(o["op"] == "create_tunnel" for o in log1)
+    assert any(o["op"] == "create_tunnel" for o in log2)
+
+    # Both tunnels must exist on disk with distinct ids and the
+    # correct, distinct target drawer_ids.
+    tunnels = mcp_server.tool_list_tunnels()
+    by_target = {
+        t["target"].get("drawer_id"): t
+        for t in tunnels
+        if t["source"].get("drawer_id") == new_id
+    }
+    assert t1_id in by_target, (
+        f"tunnel new_id→t1_id missing from disk; got tunnels={tunnels}"
+    )
+    assert t2_id in by_target, (
+        f"tunnel new_id→t2_id missing from disk; got tunnels={tunnels}"
+    )
+    assert by_target[t1_id]["id"] != by_target[t2_id]["id"], (
+        "two related_distinct tunnels in the same target wing/room got "
+        "the same canonical id; one silently overwrote the other"
+    )
+
+
 def test_apply_relation_strengthens_target_updates_body(palace_with_drawers):
     from mempalace import mcp_server, guard
 

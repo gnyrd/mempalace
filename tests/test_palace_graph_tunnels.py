@@ -1,5 +1,6 @@
 """Tests for explicit tunnel helpers in mempalace.palace_graph."""
 
+import hashlib
 import os
 import stat
 import sys
@@ -374,3 +375,301 @@ class TestHyphenatedWingNormalization:
             result = palace_graph.find_tunnels("nonexistent-wing")
         assert result == []
         assert "No tunnels found" in caplog.text
+
+
+class TestDrawerAwareTunnelIdentity:
+    """Regressions for the 2026-05-04 tunnel-id collision bug.
+
+    See vault planning doc 2026-05-04-mempalace-tunnel-id-audit-oddity.md.
+    Identity must be drawer-aware whenever either endpoint carries a
+    drawer_id; topic-level (drawer_id-less) tunnels keep room-level
+    identity. Endpoint identity is as specific as the data provided.
+    """
+
+    def test_distinct_drawer_pairs_same_wing_rooms_get_distinct_ids(
+        self, tmp_path, monkeypatch
+    ):
+        """Regression 1: multiple drawer-pair tunnels with the same source/
+        target wing+room produce distinct ids and ALL persist on disk.
+
+        Reproduces the C3 collision: two `related_distinct` ops from one
+        new drawer to two distinct targets in the same wing/room got the
+        same canonical id, second overwrote first."""
+        _use_tmp_tunnel_file(monkeypatch, tmp_path)
+
+        t1 = palace_graph.create_tunnel(
+            "wing_a", "do", "wing_b", "general",
+            source_drawer_id="drawer_A_do_111",
+            target_drawer_id="drawer_B_general_222",
+            label="related",
+        )
+        t2 = palace_graph.create_tunnel(
+            "wing_a", "do", "wing_b", "general",
+            source_drawer_id="drawer_A_do_111",
+            target_drawer_id="drawer_B_general_333",
+            label="related",
+        )
+
+        assert t1["id"] != t2["id"], (
+            "two distinct drawer pairs in the same wing/room sorted to one id; "
+            "drawer_id is being dropped from canonical hash"
+        )
+        stored = palace_graph.list_tunnels()
+        assert len(stored) == 2, f"expected 2 records on disk, got {len(stored)}"
+        targets_on_disk = {
+            t["target"].get("drawer_id") for t in stored
+        }
+        assert targets_on_disk == {"drawer_B_general_222", "drawer_B_general_333"}
+
+    def test_reversed_endpoints_same_drawer_pair_idempotent(
+        self, tmp_path, monkeypatch
+    ):
+        """Regression 2: A→B and B→A for the SAME drawer pair must
+        resolve to the same canonical id (undirected dedup preserved
+        at the drawer level)."""
+        _use_tmp_tunnel_file(monkeypatch, tmp_path)
+
+        forward = palace_graph.create_tunnel(
+            "wing_a", "do", "wing_b", "general",
+            source_drawer_id="drawer_A_do_111",
+            target_drawer_id="drawer_B_general_222",
+            label="related",
+        )
+        reverse = palace_graph.create_tunnel(
+            "wing_b", "general", "wing_a", "do",
+            source_drawer_id="drawer_B_general_222",
+            target_drawer_id="drawer_A_do_111",
+            label="related (updated)",
+        )
+
+        assert forward["id"] == reverse["id"]
+        assert len(palace_graph.list_tunnels()) == 1
+        assert reverse["label"] == "related (updated)"
+
+    def test_hyphen_vs_underscore_wing_still_equivalent_with_drawer_ids(
+        self, tmp_path, monkeypatch
+    ):
+        """Regression 3: wing-name normalization (hyphen → underscore)
+        still applies even when drawer_ids are part of the identity.
+        `vault-ops` and `vault_ops` with the same drawer pair must
+        produce the same canonical id."""
+        _use_tmp_tunnel_file(monkeypatch, tmp_path)
+
+        hyphen = palace_graph.create_tunnel(
+            "vault-ops", "do", "vault-ops", "general",
+            source_drawer_id="drawer_vault_ops_do_AAA",
+            target_drawer_id="drawer_vault_ops_general_BBB",
+            label="x",
+        )
+        underscore = palace_graph.create_tunnel(
+            "vault_ops", "do", "vault_ops", "general",
+            source_drawer_id="drawer_vault_ops_do_AAA",
+            target_drawer_id="drawer_vault_ops_general_BBB",
+            label="x",
+        )
+
+        assert hyphen["id"] == underscore["id"]
+        assert len(palace_graph.list_tunnels()) == 1
+
+    def test_topic_level_tunnels_no_drawer_ids_keep_room_idempotency(
+        self, tmp_path, monkeypatch
+    ):
+        """Regression 4a: when neither endpoint has a drawer_id (topic-level
+        cross-wing links), two calls with the same wing/room pair still
+        deduplicate to one record — preserving the existing topic-tunnel
+        contract used by `compute_topic_tunnels`."""
+        _use_tmp_tunnel_file(monkeypatch, tmp_path)
+
+        first = palace_graph.create_tunnel(
+            "wing_a", "topic:auth", "wing_b", "topic:auth", label="shared topic"
+        )
+        second = palace_graph.create_tunnel(
+            "wing_a", "topic:auth", "wing_b", "topic:auth", label="updated topic"
+        )
+
+        assert first["id"] == second["id"]
+        assert len(palace_graph.list_tunnels()) == 1
+        assert second["label"] == "updated topic"
+
+    def test_topic_level_does_not_collide_with_drawer_tagged(
+        self, tmp_path, monkeypatch
+    ):
+        """Regression 4b: a drawer-tagged tunnel (any endpoint carries a
+        drawer_id) must NOT collapse into a same-rooms topic-level tunnel.
+        Endpoint identity is as specific as the data provided."""
+        _use_tmp_tunnel_file(monkeypatch, tmp_path)
+
+        topic = palace_graph.create_tunnel(
+            "wing_a", "do", "wing_b", "general", label="topic"
+        )
+        tagged = palace_graph.create_tunnel(
+            "wing_a", "do", "wing_b", "general",
+            source_drawer_id="drawer_A_do_111",
+            target_drawer_id="drawer_B_general_222",
+            label="tagged",
+        )
+
+        assert topic["id"] != tagged["id"]
+        assert len(palace_graph.list_tunnels()) == 2
+
+    def test_rekey_migration_updates_pre_patch_drawer_tagged_ids(
+        self, tmp_path, monkeypatch
+    ):
+        """One-shot migration re-keys pre-patch drawer-tagged records.
+
+        Simulate the pre-patch state by writing a tunnels.json whose
+        drawer-tagged record has the OLD (room-only) canonical id.
+        After ``rekey_drawer_tagged_tunnels`` runs, the record's id
+        should match the drawer-aware canonical id."""
+        _use_tmp_tunnel_file(monkeypatch, tmp_path)
+
+        # Pre-patch id for vault_ops/dont ↔ vault_ops/general (sorted, no drawer_ids)
+        old_id = hashlib.sha256(
+            "vault_ops/dont↔vault_ops/general".encode()
+        ).hexdigest()[:16]
+
+        # And one topic-level record that should NOT be re-keyed.
+        topic_id = hashlib.sha256(
+            "wing_a/topic:auth↔wing_b/topic:auth".encode()
+        ).hexdigest()[:16]
+
+        palace_graph._save_tunnels([
+            {
+                "id": old_id,
+                "source": {
+                    "wing": "vault_ops", "room": "dont",
+                    "drawer_id": "drawer_vault_ops_dont_AAA",
+                },
+                "target": {
+                    "wing": "vault_ops", "room": "general",
+                    "drawer_id": "drawer_vault_ops_general_BBB",
+                },
+                "label": "related",
+                "kind": "explicit",
+                "created_at": "2026-05-01T00:00:00+00:00",
+            },
+            {
+                "id": topic_id,
+                "source": {"wing": "wing_a", "room": "topic:auth"},
+                "target": {"wing": "wing_b", "room": "topic:auth"},
+                "label": "topic",
+                "kind": "topic",
+                "created_at": "2026-05-01T00:00:00+00:00",
+            },
+        ])
+
+        report = palace_graph.rekey_drawer_tagged_tunnels()
+
+        assert report["status"] == "ok"
+        assert report["rekeyed"] == 1
+        assert report["would_rekey"] == 1
+        assert report["unchanged_drawer_tagged"] == 0
+        assert report["topic_level_skipped"] == 1
+        assert report["collisions"] == []
+
+        new_id = palace_graph._canonical_tunnel_id(
+            "vault_ops", "dont", "vault_ops", "general",
+            source_drawer_id="drawer_vault_ops_dont_AAA",
+            target_drawer_id="drawer_vault_ops_general_BBB",
+        )
+        assert new_id != old_id
+
+        stored = palace_graph._load_tunnels()
+        drawer_tagged = next(t for t in stored if t["source"].get("drawer_id"))
+        topic = next(t for t in stored if not t["source"].get("drawer_id"))
+        assert drawer_tagged["id"] == new_id
+        assert topic["id"] == topic_id  # unchanged
+
+        # Idempotence: a second run is a no-op.
+        second = palace_graph.rekey_drawer_tagged_tunnels()
+        assert second["status"] == "noop"
+        assert second["rekeyed"] == 0
+        assert second["would_rekey"] == 0
+        assert second["unchanged_drawer_tagged"] == 1
+        assert second["topic_level_skipped"] == 1
+
+    def test_rekey_migration_refuses_to_write_on_collision(
+        self, tmp_path, monkeypatch
+    ):
+        """Fail-closed: when two pre-patch records would re-key to the
+        same drawer-aware id, the helper must NOT touch the file. The
+        original (stale) ids must remain on disk so the operator can
+        review labels / created_at, pick one, delete the other, then
+        re-run."""
+        _use_tmp_tunnel_file(monkeypatch, tmp_path)
+
+        old_id = hashlib.sha256(
+            "vault_ops/dont↔vault_ops/general".encode()
+        ).hexdigest()[:16]
+        stale_id = "deadbeefdeadbeef"
+        palace_graph._save_tunnels([
+            {
+                "id": old_id,
+                "source": {"wing": "vault_ops", "room": "dont",
+                            "drawer_id": "drawer_X"},
+                "target": {"wing": "vault_ops", "room": "general",
+                            "drawer_id": "drawer_Y"},
+                "label": "first",
+                "kind": "explicit",
+                "created_at": "2026-05-01T00:00:00+00:00",
+            },
+            {
+                "id": stale_id,
+                "source": {"wing": "vault_ops", "room": "dont",
+                            "drawer_id": "drawer_X"},
+                "target": {"wing": "vault_ops", "room": "general",
+                            "drawer_id": "drawer_Y"},
+                "label": "second",
+                "kind": "explicit",
+                "created_at": "2026-05-02T00:00:00+00:00",
+            },
+        ])
+
+        report = palace_graph.rekey_drawer_tagged_tunnels()
+
+        # Fail-closed: status reflects refusal, nothing rewritten.
+        assert report["status"] == "collision_refused"
+        assert report["rekeyed"] == 0
+        # would_rekey reports what WOULD have been rewritten if collisions
+        # were resolved first — both records here.
+        assert report["would_rekey"] == 2
+        assert len(report["collisions"]) == 1
+        new_id = palace_graph._canonical_tunnel_id(
+            "vault_ops", "dont", "vault_ops", "general",
+            source_drawer_id="drawer_X",
+            target_drawer_id="drawer_Y",
+        )
+        coll_id, idx_a, idx_b = report["collisions"][0]
+        assert coll_id == new_id
+        assert idx_a == 0 and idx_b == 1
+
+        # File on disk must be untouched: original stale ids preserved.
+        stored = palace_graph._load_tunnels()
+        assert [t["id"] for t in stored] == [old_id, stale_id], (
+            "rekey helper rewrote tunnels.json despite collision; "
+            "operator cleanup is now ambiguous"
+        )
+        assert [t["label"] for t in stored] == ["first", "second"]
+
+    def test_one_endpoint_drawer_tagged_other_room_only_distinct(
+        self, tmp_path, monkeypatch
+    ):
+        """Regression 4c: asymmetric endpoint specificity is preserved.
+        A tunnel with drawer_id on source only is NOT the same as one
+        with drawer_ids on both — and not the same as topic-level."""
+        _use_tmp_tunnel_file(monkeypatch, tmp_path)
+
+        source_only = palace_graph.create_tunnel(
+            "wing_a", "do", "wing_b", "general",
+            source_drawer_id="drawer_A_do_111",
+            label="source only",
+        )
+        both = palace_graph.create_tunnel(
+            "wing_a", "do", "wing_b", "general",
+            source_drawer_id="drawer_A_do_111",
+            target_drawer_id="drawer_B_general_222",
+            label="both",
+        )
+
+        assert source_only["id"] != both["id"]
+        assert len(palace_graph.list_tunnels()) == 2

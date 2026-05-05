@@ -391,18 +391,43 @@ def _endpoint_key(wing: str, room: str) -> str:
     return f"{wing}/{room}"
 
 
+def _endpoint_token(wing: str, room: str, drawer_id: str | None) -> str:
+    """Endpoint identity for the canonical tunnel id.
+
+    Identity is as specific as the data provided: when the caller passes a
+    ``drawer_id``, the token incorporates it (drawer-level identity);
+    otherwise the token is room-level (topic-tunnel identity). This lets
+    drawer-tagged tunnels coexist with topic-level tunnels between the
+    same rooms without collapsing into one record.
+    """
+    if drawer_id:
+        return f"{wing}/{room}#{drawer_id}"
+    return f"{wing}/{room}"
+
+
 def _canonical_tunnel_id(
-    source_wing: str, source_room: str, target_wing: str, target_room: str
+    source_wing: str,
+    source_room: str,
+    target_wing: str,
+    target_room: str,
+    source_drawer_id: str | None = None,
+    target_drawer_id: str | None = None,
 ) -> str:
     """Compute a symmetric tunnel ID.
 
     Tunnels are conceptually undirected — "auth relates to users" is the
-    same connection as "users relates to auth". Sort the two endpoints
-    before hashing so ``create_tunnel(A, B)`` and ``create_tunnel(B, A)``
-    resolve to the same ID and dedup into one record.
+    same connection as "users relates to auth". Sort the two endpoint
+    tokens before hashing so ``create_tunnel(A, B)`` and
+    ``create_tunnel(B, A)`` resolve to the same ID and dedup into one
+    record.
+
+    Each endpoint's identity is as specific as the caller provided
+    (drawer-level when a ``drawer_id`` is given, room-level otherwise),
+    so two distinct drawer-pairs in the same source/target wing+room
+    produce distinct ids and persist as distinct records.
     """
-    src = _endpoint_key(source_wing, source_room)
-    tgt = _endpoint_key(target_wing, target_room)
+    src = _endpoint_token(source_wing, source_room, source_drawer_id)
+    tgt = _endpoint_token(target_wing, target_room, target_drawer_id)
     a, b = sorted((src, tgt))
     return hashlib.sha256(f"{a}↔{b}".encode()).hexdigest()[:16]
 
@@ -463,7 +488,14 @@ def create_tunnel(
     source_wing = _normalize_wing(source_wing)
     target_wing = _normalize_wing(target_wing)
 
-    tunnel_id = _canonical_tunnel_id(source_wing, source_room, target_wing, target_room)
+    tunnel_id = _canonical_tunnel_id(
+        source_wing,
+        source_room,
+        target_wing,
+        target_room,
+        source_drawer_id=source_drawer_id,
+        target_drawer_id=target_drawer_id,
+    )
 
     tunnel = {
         "id": tunnel_id,
@@ -495,6 +527,142 @@ def create_tunnel(
         tunnels.append(tunnel)
         _save_tunnels(tunnels)
     return tunnel
+
+
+def rekey_drawer_tagged_tunnels() -> dict:
+    """Re-key existing drawer-tagged tunnel records to drawer-aware ids.
+
+    One-shot migration after the 2026-05-04 patch that made tunnel
+    identity drawer-aware. Pre-patch records were stored under
+    room-level ids (wing/room ↔ wing/room) regardless of their
+    drawer_id metadata; without this re-key, two scenarios remain
+    broken:
+
+    * A repeat ``create_tunnel`` for the same drawer pair computes a
+      new (drawer-aware) id, doesn't match the old record, and appends
+      a duplicate.
+    * A topic-level ``create_tunnel`` for the same wing/room pair
+      computes the old (room-only) id, matches the pre-patch record,
+      and overwrites its drawer_id metadata.
+
+    Walks every record in the tunnels store. For any record carrying
+    a ``source.drawer_id`` or ``target.drawer_id``, recomputes the
+    canonical id under the patched algorithm and updates the record's
+    ``id`` field if it differs. Records with no drawer_ids on either
+    endpoint (topic-level tunnels) keep their existing ids.
+
+    Idempotent: a second run finds nothing to re-key.
+
+    Fail-closed on collision: the helper precomputes every proposed
+    new id BEFORE touching the file. If two records would post-rekey
+    share the same drawer-aware id, NOTHING is written — the original
+    tunnels.json is left untouched and ``status: "collision_refused"``
+    is returned. The operator must merge / delete the duplicates by
+    hand and re-run the helper.
+
+    Returns a summary dict::
+
+        {
+          "status": "ok" | "collision_refused" | "noop",
+          "rekeyed": int,                       # records actually rewritten
+          "would_rekey": int,                   # proposed rewrites (= rekeyed when status=ok)
+          "unchanged_drawer_tagged": int,       # already correct
+          "topic_level_skipped": int,           # no drawer_ids on either side
+          "total": int,
+          "collisions": [(id, idx_a, idx_b), ...],  # post-rekey duplicates
+        }
+
+    ``status`` values:
+
+    * ``"ok"`` — no collisions found, ``rekeyed`` records were rewritten
+      and the file was saved.
+    * ``"noop"`` — every drawer-tagged record already has the correct
+      drawer-aware id (idempotent re-run); file untouched.
+    * ``"collision_refused"`` — at least one collision detected; file
+      untouched, ``rekeyed`` is 0, ``would_rekey`` reports what would
+      have been rewritten if the collisions were resolved first.
+
+    Collisions indicate two records that re-key to the same new id —
+    i.e. a pre-existing redundant pair on disk for the same drawer
+    pair. Resolution is operator-driven (review labels / created_at,
+    pick one, delete the other) before re-running.
+    """
+    with mine_lock(_TUNNEL_FILE):
+        tunnels = _load_tunnels()
+        unchanged = 0
+        topic_level = 0
+        # Compute every proposed id without mutating the records.
+        proposed_ids: list[str] = []
+        for t in tunnels:
+            src = t.get("source") or {}
+            tgt = t.get("target") or {}
+            src_drawer = src.get("drawer_id")
+            tgt_drawer = tgt.get("drawer_id")
+            if not src_drawer and not tgt_drawer:
+                topic_level += 1
+                proposed_ids.append(t.get("id"))
+            else:
+                new_id = _canonical_tunnel_id(
+                    src.get("wing", ""),
+                    src.get("room", ""),
+                    tgt.get("wing", ""),
+                    tgt.get("room", ""),
+                    source_drawer_id=src_drawer,
+                    target_drawer_id=tgt_drawer,
+                )
+                proposed_ids.append(new_id)
+                if t.get("id") == new_id:
+                    unchanged += 1
+
+        # Detect collisions in the post-rekey id space before writing.
+        seen_ids: dict[str, int] = {}
+        collisions: list[tuple[str, int, int]] = []
+        for idx, pid in enumerate(proposed_ids):
+            if pid in seen_ids:
+                collisions.append((pid, seen_ids[pid], idx))
+            else:
+                seen_ids[pid] = idx
+
+        would_rekey = sum(
+            1 for t, pid in zip(tunnels, proposed_ids)
+            if t.get("id") != pid
+        )
+
+        # Apply rewrites only when no collisions and something to do.
+        if collisions:
+            return {
+                "status": "collision_refused",
+                "rekeyed": 0,
+                "would_rekey": would_rekey,
+                "unchanged_drawer_tagged": unchanged,
+                "topic_level_skipped": topic_level,
+                "total": len(tunnels),
+                "collisions": collisions,
+            }
+
+        if would_rekey == 0:
+            return {
+                "status": "noop",
+                "rekeyed": 0,
+                "would_rekey": 0,
+                "unchanged_drawer_tagged": unchanged,
+                "topic_level_skipped": topic_level,
+                "total": len(tunnels),
+                "collisions": [],
+            }
+
+        for t, pid in zip(tunnels, proposed_ids):
+            t["id"] = pid
+        _save_tunnels(tunnels)
+        return {
+            "status": "ok",
+            "rekeyed": would_rekey,
+            "would_rekey": would_rekey,
+            "unchanged_drawer_tagged": unchanged,
+            "topic_level_skipped": topic_level,
+            "total": len(tunnels),
+            "collisions": [],
+        }
 
 
 def list_tunnels(wing: str = None):
