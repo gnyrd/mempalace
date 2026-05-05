@@ -42,7 +42,16 @@ def _reset_mcp_cache(monkeypatch, tmp_path_factory):
     """
     import json
 
-    # Set policy to "allow" for tool_add_drawer by default in tests
+    # Default policy for ALL tests: tool_add_drawer is "allow"-pass-through.
+    # Why: after Task 12 landed, the production default `Policy.deprecated_add_drawer_response`
+    # is "refuse". Tests that call `mcp_server.tool_add_drawer(...)` without
+    # an explicit policy fixture (most existing tests) would otherwise be
+    # rejected by the gate. This default keeps pre-Task-12 tests green.
+    #
+    # **Future authors: if you need to test "what does an unconfigured
+    # MemPalace install do?" (default policy = "refuse"), set your own
+    # MEMPALACE_POLICY_PATH inside the test — it overrides this autouse
+    # default since pytest's monkeypatch is per-test.**
     policy_dir = tmp_path_factory.mktemp("mempalace_policy")
     policy_path = policy_dir / "policy.json"
     policy_path.write_text(json.dumps({"deprecated_add_drawer_response": "allow"}))
