@@ -908,7 +908,7 @@ def tool_commit_write(
 
         # Fate-level: create or skip the new drawer
         if fate == guard.Fate.CREATE_NEW:
-            add_res = tool_add_drawer(
+            add_res = _tool_add_drawer_unguarded(
                 wing=rec.wing, room=rec.room, content=rec.prepared_content,
             )
             if not add_res.get("success"):
@@ -1115,7 +1115,35 @@ def tool_follow_tunnels(wing: str, room: str):
 # ==================== WRITE TOOLS ====================
 
 
-def tool_add_drawer(
+def tool_add_drawer(*args, **kwargs):
+    """Add a drawer. Gated by policy.deprecated_add_drawer_response.
+
+    When policy is "refuse", returns an error pointing callers at
+    tool_prepare_write / tool_commit_write. When "warn", succeeds but logs
+    a deprecation warning. When "allow", passes through to the unguarded
+    implementation.
+    """
+    from mempalace.policy import load_policy
+    pol = load_policy()
+    response = pol.deprecated_add_drawer_response
+
+    if response == "refuse":
+        return {
+            "success": False,
+            "error": (
+                "tool_add_drawer is gated by policy. Use tool_prepare_write + "
+                "tool_commit_write for guarded writes (see write-guard v2 spec)."
+            ),
+        }
+    if response == "warn":
+        logger.warning(
+            "tool_add_drawer is deprecated; use tool_prepare_write + "
+            "tool_commit_write for guarded writes (see write-guard v2 spec)."
+        )
+    return _tool_add_drawer_unguarded(*args, **kwargs)
+
+
+def _tool_add_drawer_unguarded(
     wing: str, room: str, content: str, source_file: str = None, added_by: str = "mcp"
 ):
     """File verbatim content into a wing/room. Checks for duplicates first."""

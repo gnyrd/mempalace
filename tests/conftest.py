@@ -35,8 +35,18 @@ from mempalace.knowledge_graph import KnowledgeGraph  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
-def _reset_mcp_cache():
-    """Reset the MCP server's cached ChromaDB client/collection between tests."""
+def _reset_mcp_cache(monkeypatch, tmp_path_factory):
+    """Reset the MCP server's cached ChromaDB client/collection between tests.
+
+    Also sets policy.json to allow tool_add_drawer by default (Task 12 gating).
+    """
+    import json
+
+    # Set policy to "allow" for tool_add_drawer by default in tests
+    policy_dir = tmp_path_factory.mktemp("mempalace_policy")
+    policy_path = policy_dir / "policy.json"
+    policy_path.write_text(json.dumps({"deprecated_add_drawer_response": "allow"}))
+    monkeypatch.setenv("MEMPALACE_POLICY_PATH", str(policy_path))
 
     def _clear_cache():
         try:
