@@ -829,13 +829,21 @@ def tool_commit_write(
             merged_content=merged_content,
         )
     except guard.ValidationError as e:
+        # The error path may be hit precisely BECAUSE candidate_relations entries
+        # are malformed (non-dict or missing drawer_id). Build the audit-trail
+        # defensively here — `r["drawer_id"]` would raise bare KeyError on the
+        # very inputs we just rejected, masking the typed ValidationError.
+        # (Codex Checkpoint B P1 #2 — flagged for v2.2 plan.)
         return {
             "error": str(e),
             "audit_trail": {
                 "prepare_token": guard_token[:8] + "...",
                 "fate": fate,
                 "candidate_ids_seen": rec.blocking_ids,
-                "candidate_ids_addressed": [r["drawer_id"] for r in candidate_relations],
+                "candidate_ids_addressed": [
+                    r.get("drawer_id") if isinstance(r, dict) else None
+                    for r in candidate_relations
+                ],
                 "candidate_relations": candidate_relations,
                 "advisory_acknowledged": advisory_acknowledged,
                 "ops_attempted": [], "ops_completed": [],
@@ -954,22 +962,42 @@ def tool_commit_write(
             ),
         }
 
-    # Success path
+    # Success path. Per spec § Relation table, `fate=skip_new` with
+    # `relation=duplicate` "returns drawer_id of duplicate" — surface those
+    # ids in resulting_drawer_ids so callers can route to the existing drawer
+    # without re-querying. (Codex Checkpoint B P2 — flagged for v2.2 plan.)
+    from mempalace import guard as _guard
+    if fate == _guard.Fate.SKIP_NEW:
+        resulting_drawer_ids = [
+            r["drawer_id"] for r in candidate_relations
+            if r["relation"] == _guard.Relation.DUPLICATE
+        ]
+    else:
+        resulting_drawer_ids = [new_drawer_id] if new_drawer_id else []
+
     return {
         "fate_taken": fate,
-        "resulting_drawer_ids": [new_drawer_id] if new_drawer_id else [],
+        "resulting_drawer_ids": resulting_drawer_ids,
         "resulting_tunnel_ids": ctx.created_tunnel_ids,
         "audit_trail": _build_audit_trail(
             guard_token, fate, rec, candidate_relations, advisory_acknowledged,
             ctx, started_at, new_drawer_id,
+            resulting_drawer_ids=resulting_drawer_ids,
         ),
     }
 
 
 def _build_audit_trail(token, fate, rec, candidate_relations, advisory_acknowledged,
-                      ctx, started_at, new_drawer_id):
+                      ctx, started_at, new_drawer_id, resulting_drawer_ids=None):
     import time
     from mempalace import guard
+    if resulting_drawer_ids is None:
+        # Failure paths (TokenError/Validation already returned earlier; this
+        # default applies to GuardOpError/Exception paths where we don't have
+        # the fate-aware resolution computed). new_drawer_id is the in-flight
+        # add — surfaced even if rollback ran, so the audit trail records
+        # what was attempted.
+        resulting_drawer_ids = [new_drawer_id] if new_drawer_id else []
     return {
         "prepare_token": token[:8] + "...",
         "fate": fate,
@@ -983,7 +1011,7 @@ def _build_audit_trail(token, fate, rec, candidate_relations, advisory_acknowled
         "rollback_completed": ctx.rollback_completed,
         "rollback_errors": ctx.rollback_errors,  # per-op errors during rollback (empty on success)
         "preimages_captured": list(ctx.preimages.keys()),
-        "resulting_drawer_ids": [new_drawer_id] if new_drawer_id else [],
+        "resulting_drawer_ids": resulting_drawer_ids,
         "resulting_tunnel_ids": ctx.created_tunnel_ids,
         "elapsed_ms": int((time.time() - started_at) * 1000),
     }
@@ -1984,6 +2012,90 @@ TOOLS = {
             "required": ["content"],
         },
         "handler": tool_check_duplicate,
+    },
+    "mempalace_prepare_write": {
+        "description": (
+            "Stage a guarded write. Step 1 of the prepare/commit two-step "
+            "protocol — returns a guard_token plus blocking and advisory "
+            "candidates the agent must classify before commit_write. Use "
+            "this instead of add_drawer when the policy requires guarded "
+            "writes."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "content": {
+                    "type": "string",
+                    "description": "Verbatim content to file (full drawer body, including typed-memory header)",
+                },
+                "wing": {"type": "string", "description": "Wing (project name)"},
+                "room": {
+                    "type": "string",
+                    "description": "Room (do | dont | general | ...)",
+                },
+                "type": {
+                    "type": "string",
+                    "description": "Drawer type (evidence | decision | contradiction | resolution | ...)",
+                },
+                "date": {
+                    "type": "string",
+                    "description": "Semantic date (YYYY-MM-DD)",
+                },
+                "source": {
+                    "type": "string",
+                    "description": "Where this came from (e.g. 'save-session', 'ad-hoc')",
+                },
+                "threshold": {
+                    "type": "number",
+                    "description": "Override similarity threshold for blocking candidates (defaults to policy)",
+                },
+            },
+            "required": ["content", "wing", "room", "type", "date", "source"],
+        },
+        "handler": tool_prepare_write,
+    },
+    "mempalace_commit_write": {
+        "description": (
+            "Commit a guarded write previously staged via prepare_write. "
+            "Step 2 of the prepare/commit two-step protocol. Validates "
+            "fate-vs-relation rules, re-checks candidates against the "
+            "current palace, performs per-relation operations with "
+            "compensating rollback on failure, and returns an audit trail."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "guard_token": {
+                    "type": "string",
+                    "description": "Token returned by prepare_write (single-use)",
+                },
+                "fate": {
+                    "type": "string",
+                    "description": "create_new | skip_new | update_existing",
+                },
+                "candidate_relations": {
+                    "type": "array",
+                    "description": (
+                        "One entry per blocking candidate from prepare_write. "
+                        "Each entry: {drawer_id, relation, association?}. "
+                        "relation ∈ {duplicate, supersedes, resolves_contradiction, "
+                        "related_distinct, strengthens_target, ignored_spurious}."
+                    ),
+                    "items": {"type": "object"},
+                },
+                "advisory_acknowledged": {
+                    "type": "array",
+                    "description": "drawer_ids from advisory_candidates the agent saw (audit-only)",
+                    "items": {"type": "string"},
+                },
+                "merged_content": {
+                    "type": "string",
+                    "description": "Required when any relation is strengthens_target",
+                },
+            },
+            "required": ["guard_token", "fate"],
+        },
+        "handler": tool_commit_write,
     },
     "mempalace_add_drawer": {
         "description": "File verbatim content into the palace. Checks for duplicates first.",

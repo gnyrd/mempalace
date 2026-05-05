@@ -86,6 +86,42 @@ Returns the AAAK dialect specification.
 
 ## Palace — Write Tools
 
+### `mempalace_prepare_write`
+
+Stage a guarded write. Step 1 of the prepare/commit two-step protocol that gates new drawer writes against unassociated near-neighbor candidates. Returns a `guard_token` plus blocking and advisory candidates the agent must classify before calling `mempalace_commit_write`. Use this when the policy requires guarded writes (the default once write-guard v2 is enabled); fall back to `mempalace_add_drawer` only for unguarded migration paths.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `content` | string | **Yes** | Verbatim drawer body (full content, including the typed-memory header) |
+| `wing` | string | **Yes** | Wing (project name) |
+| `room` | string | **Yes** | Room (`do` \| `dont` \| `general` \| ...) |
+| `type` | string | **Yes** | Drawer type (`evidence` \| `decision` \| `contradiction` \| `resolution` \| ...) |
+| `date` | string | **Yes** | Semantic date (YYYY-MM-DD) |
+| `source` | string | **Yes** | Provenance (e.g. `save-session`, `ad-hoc`) |
+| `threshold` | number | No | Override similarity threshold for blocking candidates (defaults to policy) |
+
+**Returns:** `{ guard_token, expires_at, blocking_candidates: [{ drawer_id, title, body, wing, room, type, similarity }, ...], advisory_candidates: [...] }`
+
+---
+
+### `mempalace_commit_write`
+
+Commit a guarded write previously staged via `mempalace_prepare_write`. Step 2 of the prepare/commit two-step protocol. Validates fate-vs-relation rules, re-checks candidates against the current palace (parallel-writer race detection), performs per-relation operations with compensating rollback on failure, and returns an audit trail.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `guard_token` | string | **Yes** | Token returned by `mempalace_prepare_write` (single-use) |
+| `fate` | string | **Yes** | `create_new` \| `skip_new` \| `update_existing` |
+| `candidate_relations` | array | No | One entry per blocking candidate: `{ drawer_id, relation, association? }`. `relation` ∈ `{duplicate, supersedes, resolves_contradiction, related_distinct, strengthens_target, ignored_spurious}`. |
+| `advisory_acknowledged` | array | No | `drawer_id`s from `advisory_candidates` the agent saw (audit-only) |
+| `merged_content` | string | No | Required when any relation is `strengthens_target` |
+
+**Returns on success:** `{ fate_taken, resulting_drawer_ids, resulting_tunnel_ids, audit_trail }`. For `fate=skip_new`, `resulting_drawer_ids` lists the existing duplicate drawer ids so callers can route to them without re-querying.
+
+**Returns on error:** `{ error, audit_trail }` — distinguishable error strings include `unknown token`, `expired token`, validation messages from fate/relation rule violations, and `candidates_changed_call_prepare_again` (the blocking-candidate set changed between prepare and commit).
+
+---
+
 ### `mempalace_add_drawer`
 
 File verbatim content into the palace. Identical content (same deterministic drawer ID) is silently skipped. For similarity-based duplicate detection before filing, use `mempalace_check_duplicate`.

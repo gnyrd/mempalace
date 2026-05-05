@@ -64,7 +64,14 @@ def test_skip_new_returns_existing_drawer_id(palace):
               for c in pr["blocking_candidates"] if c["drawer_id"] != seed_id],
     )
     assert cr["fate_taken"] == "skip_new"
-    assert cr["resulting_drawer_ids"] == []  # no new drawer
+    # Per spec § Relation table: skip_new + duplicate must surface the
+    # existing drawer_id so callers can route to it without re-querying.
+    # (Codex Checkpoint B P2 fix.)
+    assert cr["resulting_drawer_ids"] == [seed_id], (
+        f"skip_new must return the duplicate drawer's id, got "
+        f"{cr['resulting_drawer_ids']!r}"
+    )
+    assert cr["audit_trail"]["resulting_drawer_ids"] == [seed_id]
 
 
 def test_update_existing_replaces_target_body(palace):
@@ -202,3 +209,74 @@ def test_commit_refuses_expired_token(palace, monkeypatch):
     )
     assert "error" in cr
     assert "expired" in cr["error"]
+
+
+# ----------------------------------------------------------------------------
+# Malformed candidate_relations — MCP-level coverage of validate_commit_args's
+# shape rules. Codex Checkpoint B P1 #2: the ValidationError audit-trail must
+# return the typed error rather than raise bare KeyError when entries lack
+# `drawer_id` or aren't dicts. validate_commit_args is unit-tested in
+# test_guard_validation.py; these tests exercise the same path through
+# tool_commit_write so the error response stays well-formed end-to-end.
+# ----------------------------------------------------------------------------
+
+
+def test_commit_with_non_dict_relation_returns_typed_error(palace):
+    from mempalace import mcp_server
+    pr = mcp_server.tool_prepare_write(
+        content=_drawer("malformed1"),
+        wing="testwing", room="do", type="evidence",
+        date="2026-05-04", source="test",
+    )
+    cr = mcp_server.tool_commit_write(
+        guard_token=pr["guard_token"],
+        fate="create_new",
+        candidate_relations=["not a dict"],
+    )
+    assert "error" in cr
+    assert "must be a dict" in cr["error"]
+    # Audit trail must be present and well-formed (no bare KeyError leaked)
+    audit = cr["audit_trail"]
+    assert "candidate_ids_addressed" in audit
+    # Non-dict entries serialize to None in the audit trail
+    assert audit["candidate_ids_addressed"] == [None]
+
+
+def test_commit_with_missing_drawer_id_returns_typed_error(palace):
+    from mempalace import mcp_server
+    pr = mcp_server.tool_prepare_write(
+        content=_drawer("malformed2"),
+        wing="testwing", room="do", type="evidence",
+        date="2026-05-04", source="test",
+    )
+    cr = mcp_server.tool_commit_write(
+        guard_token=pr["guard_token"],
+        fate="create_new",
+        candidate_relations=[{"relation": "supersedes"}],  # no drawer_id
+    )
+    assert "error" in cr
+    assert "missing required key 'drawer_id'" in cr["error"]
+    audit = cr["audit_trail"]
+    assert "candidate_ids_addressed" in audit
+    assert audit["candidate_ids_addressed"] == [None]
+
+
+def test_commit_with_missing_relation_returns_typed_error(palace):
+    from mempalace import mcp_server
+    pr = mcp_server.tool_prepare_write(
+        content=_drawer("malformed3"),
+        wing="testwing", room="do", type="evidence",
+        date="2026-05-04", source="test",
+    )
+    cr = mcp_server.tool_commit_write(
+        guard_token=pr["guard_token"],
+        fate="create_new",
+        candidate_relations=[{"drawer_id": "does-not-matter"}],  # no relation
+    )
+    assert "error" in cr
+    assert "missing required key 'relation'" in cr["error"]
+    audit = cr["audit_trail"]
+    # When drawer_id IS present, audit_trail surfaces it even though the
+    # entry was rejected for missing relation — the typed error tells the
+    # agent what to fix.
+    assert audit["candidate_ids_addressed"] == ["does-not-matter"]
